@@ -20,10 +20,10 @@ MoE（Mixture-of-Experts）Expert Offloading 插件，适用于 [vllm-ascend](ht
 
 | 依赖 | 说明 |
 |------|------|
-| Python ≥ 3.9 | |
-| vllm | 上游 vllm，需支持 `vllm.platform_plugins` |
-| vllm-ascend 或 vllm-ascend-hust | NPU 平台后端，需包含本插件的 hook 接缝（见下方说明） |
-| Ascend CANN | NPU 驱动环境 |
+| Python ≥ 3.10 | |
+| Ascend CANN | NPU 驱动环境，需在安装 vllm-ascend-hust 前配置好 |
+| vllm-hust | vllm 主体（含 `vllm.platform_plugins` 支持） |
+| vllm-ascend-hust | NPU 平台后端，需包含本插件的 hook 接缝（见下方说明） |
 
 > **重要**：vllm-ascend-hust 需包含 `vllm_ascend/_moe_offload_null.py` 的改动（将 moe_offload 相关 import 改为 try/except 可选加载）。若使用上游官方 vllm-ascend，需先提 PR 合入该改动，或在本地手动 patch。
 
@@ -31,19 +31,26 @@ MoE（Mixture-of-Experts）Expert Offloading 插件，适用于 [vllm-ascend](ht
 
 ## 安装
 
-### 方式一：pip 可编辑安装（研究开发推荐）
+### 方式一：从源码可编辑安装（研究开发推荐）
 
 ```bash
-# 1. 安装 vllm-ascend-hust（包含插件 hook 接缝）
-pip install -e /path/to/vllm-ascend-hust
+# 1. 克隆 vllm-hust（vllm 主体）
+git clone https://github.com/vLLM-HUST/vllm-hust.git
+pip install -e vllm-hust
 
-# 2. 安装本插件
-pip install -e /path/to/vllm-moe-offload-ascend
-# 或从 GitHub 安装：
-pip install git+https://github.com/Li-changwu/vllm-moe-offload-ascend.git
+# 2. 克隆并安装 vllm-ascend-hust（NPU 后端，含插件 hook 接缝）
+#    需提前配置好 CANN 环境并设置 SOC_VERSION，例如：
+#    export SOC_VERSION=ascend910b1  # Atlas A2
+#    export SOC_VERSION=ascend910_9392  # Atlas A3
+git clone https://github.com/vLLM-HUST/vllm-ascend-hust.git
+pip install -e vllm-ascend-hust
+
+# 3. 克隆并安装本插件
+git clone https://github.com/Li-changwu/vllm-moe-offload-ascend.git
+pip install -e vllm-moe-offload-ascend
 ```
 
-### 方式二：只安装插件（vllm-ascend-hust 已装）
+### 方式二：直接 pip 安装（vllm-hust 和 vllm-ascend-hust 已装）
 
 ```bash
 pip install git+https://github.com/Li-changwu/vllm-moe-offload-ascend.git
