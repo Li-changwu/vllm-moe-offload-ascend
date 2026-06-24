@@ -1,0 +1,148 @@
+#
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# This file is a part of the vllm-ascend project.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from dataclasses import dataclass
+
+import torch
+
+from vllm_moe_offload_ascend.moe_offload.expert_key import ExpertKey
+from vllm_moe_offload_ascend.moe_offload.host_store import ExpertWeightBundle
+from vllm_moe_offload_ascend.moe_offload.layout import LayoutValidator
+from vllm_moe_offload_ascend.moe_offload.slot_bank import ExpertSlotBank, SlotState
+
+
+def _dedupe_preserve_order(values: tuple[int, ...]) -> tuple[int, ...]:
+    seen: set[int] = set()
+    deduped: list[int] = []
+    for value in values:
+        int_value = int(value)
+        if int_value not in seen:
+            seen.add(int_value)
+            deduped.append(int_value)
+    return tuple(deduped)
+
+
+@dataclass(frozen=True)
+class ExpertSlotMapping:
+    layer_id: int
+    active_experts: tuple[int, ...]
+    logical_to_physical: torch.Tensor
+    slot_to_expert: tuple[int | None, ...]
+    active_slot_ids: tuple[int, ...]
+
+    @classmethod
+    def from_slot_bank(
+        cls,
+        *,
+        layer_id: int,
+        active_experts: tuple[int, ...],
+        num_logical_experts: int,
+        slot_bank: ExpertSlotBank,
+        device: torch.device,
+        dtype: torch.dtype = torch.int32,
+    ) -> "ExpertSlotMapping":
+        if num_logical_experts <= 0:
+            raise ValueError("num_logical_experts must be greater than 0")
+
+        layer_id = int(layer_id)
+        unique_active_experts = _dedupe_preserve_order(tuple(int(expert_id) for expert_id in active_experts))
+        logical_to_physical = torch.full(
+            (int(num_logical_experts),),
+            fill_value=-1,
+            dtype=dtype,
+            device=device,
+        )
+        slot_to_expert: list[int | None] = [None] * len(slot_bank.slots)
+        active_slot_ids: list[int] = []
+
+        for expert_id in unique_active_experts:
+            if expert_id < 0 or expert_id >= num_logical_experts:
+                raise ValueError(f"active expert {expert_id} is outside num_logical_experts={num_logical_experts}")
+
+            slot = slot_bank.lookup(ExpertKey(layer_id, expert_id))
+            if slot is None:
+                raise RuntimeError(f"active expert {expert_id} is not resident in layer {layer_id}")
+            if slot.state != SlotState.READY:
+                raise RuntimeError(f"active expert {expert_id} slot {slot.slot_id} is not ready")
+
+            logical_to_physical[expert_id] = int(slot.slot_id)
+            active_slot_ids.append(int(slot.slot_id))
+
+        for slot in slot_bank.slots:
+            if slot.expert_key is not None:
+                slot_to_expert[slot.slot_id] = int(slot.expert_key.expert_id)
+
+        return cls(
+            layer_id=layer_id,
+            active_experts=unique_active_experts,
+            logical_to_physical=logical_to_physical,
+            slot_to_expert=tuple(slot_to_expert),
+            active_slot_ids=tuple(active_slot_ids),
+        )
+
+    def remap_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        remapped = self.logical_to_physical[topk_ids]
+        if remapped.device.type == "cpu" and bool((remapped < 0).any().item()):
+            raise RuntimeError("topk_ids contain experts without ready slots")
+        return remapped
+
+
+@dataclass(frozen=True)
+class PreparedSlotWeights:
+    w1: torch.Tensor
+    w2: torch.Tensor
+    log2phy: torch.Tensor
+    physical_expert_count: int
+    mapping: ExpertSlotMapping
+
+    def validate_backend_ready(self, *, expected_device_type: str) -> None:
+        if self.physical_expert_count <= 0:
+            raise ValueError("physical_expert_count must be greater than 0")
+        if self.w1.shape[0] != self.physical_expert_count:
+            raise ValueError(
+                "w1 physical expert count mismatch: "
+                f"{self.w1.shape[0]} != {self.physical_expert_count}"
+            )
+        if self.w2.shape[0] != self.physical_expert_count:
+            raise ValueError(
+                "w2 physical expert count mismatch: "
+                f"{self.w2.shape[0]} != {self.physical_expert_count}"
+            )
+        LayoutValidator.validate_backend_ready(
+            ExpertWeightBundle(
+                layer_id=self.mapping.layer_id,
+                expert_id=-1,
+                w13=self.w1,
+                w2=self.w2,
+            ),
+            expected_device_type=expected_device_type,
+        )
+
+    @classmethod
+    def from_slot_bank(
+        cls,
+        *,
+        slot_bank: ExpertSlotBank,
+        mapping: ExpertSlotMapping,
+    ) -> "PreparedSlotWeights":
+        return cls(
+            w1=slot_bank.w13_slots,
+            w2=slot_bank.w2_slots,
+            log2phy=mapping.logical_to_physical,
+            physical_expert_count=len(slot_bank.slots),
+            mapping=mapping,
+        )
