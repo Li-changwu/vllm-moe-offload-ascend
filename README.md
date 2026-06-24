@@ -33,19 +33,23 @@ MoE（Mixture-of-Experts）Expert Offloading 插件，适用于 [vllm-ascend](ht
 
 ### 方式一：从源码可编辑安装（研究开发推荐）
 
+**步骤 1：安装 vllm-hust 和 vllm-ascend-hust**
+
+通过 [vllm-hust-dev-hub](https://github.com/vLLM-HUST/vllm-hust-dev-hub) 一键初始化整个 workspace：
+
 ```bash
-# 1. 克隆 vllm-hust（vllm 主体）
-git clone https://github.com/vLLM-HUST/vllm-hust.git
-pip install -e vllm-hust
+git clone git@github.com:vLLM-HUST/vllm-hust-dev-hub.git
+```
+这个命令会下载这个代码仓。然后运行：
+```bash
+cd vllm-hust-dev-hub
+bash scripts/quickstart.sh
+```
+首次使用请选择菜单项1。脚本会自动下载整个workspace的代码。
 
-# 2. 克隆并安装 vllm-ascend-hust（NPU 后端，含插件 hook 接缝）
-#    需提前配置好 CANN 环境并设置 SOC_VERSION，例如：
-#    export SOC_VERSION=ascend910b1  # Atlas A2
-#    export SOC_VERSION=ascend910_9392  # Atlas A3
-git clone https://github.com/vLLM-HUST/vllm-ascend-hust.git
-pip install -e vllm-ascend-hust
+**步骤 2：安装本插件**
 
-# 3. 克隆并安装本插件
+```bash
 git clone https://github.com/Li-changwu/vllm-moe-offload-ascend.git
 pip install -e vllm-moe-offload-ascend
 ```
