@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 from vllm_ascend import envs
 from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
+from vllm_moe_offload_ascend.moe_offload.cpu_first_loader import is_cpu_first_layer
 from vllm_moe_offload_ascend.moe_offload.compute_bucket import (
     ComputeBucketClassifier,
     ComputeBucketDecision,
@@ -43,6 +44,11 @@ from vllm_moe_offload_ascend.moe_offload.trace_collector import TraceCollector, 
 from vllm_moe_offload_ascend.moe_offload.expert_weight_release import release_layer_original_expert_weights
 from vllm_moe_offload_ascend.moe_offload.tiered_residency import TieredResidencyPolicy
 from vllm_moe_offload_ascend.moe_offload.transfer_engine import TransferEngine
+
+
+def _env_value(name: str, default: str = "") -> str:
+    return str(os.getenv(name, getattr(envs, name, default)) or "")
+
 
 @dataclass(frozen=True)
 class MoeOffloadMemoryLedger:
@@ -416,9 +422,11 @@ class MoeOffloadRuntime:
             raise ValueError("layer.layer_id is required for fixed-slot registration")
 
         start = perf_counter()
+        cpu_first_layer = is_cpu_first_layer(layer)
         host_store_report = self._host_store.register_layer(
             layer,
             pin_memory=self.config.should_pin_host_memory,
+            clone_tensors=not cpu_first_layer,
         )
         w13_weight = getattr(layer, "w13_weight")
         w2_weight = getattr(layer, "w2_weight")
@@ -807,14 +815,8 @@ class MoeOffloadRuntime:
         )
         collect_profile = bool(record_stage_profile) and bool(
             self.config.gmm_profile_path
-            or os.getenv(
-                "VLLM_ASCEND_MOE_GMM_PROFILE_PATH",
-                envs.VLLM_ASCEND_MOE_GMM_PROFILE_PATH,
-            )
-            or os.getenv(
-                "VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH",
-                envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH,
-            )
+            or _env_value("VLLM_ASCEND_MOE_GMM_PROFILE_PATH")
+            or _env_value("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH")
         )
         hit_experts: list[int] = []
         miss_experts: list[int] = []
@@ -951,14 +953,8 @@ class MoeOffloadRuntime:
         )
         collect_profile = bool(record_stage_profile) and bool(
             self.config.gmm_profile_path
-            or os.getenv(
-                "VLLM_ASCEND_MOE_GMM_PROFILE_PATH",
-                envs.VLLM_ASCEND_MOE_GMM_PROFILE_PATH,
-            )
-            or os.getenv(
-                "VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH",
-                envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH,
-            )
+            or _env_value("VLLM_ASCEND_MOE_GMM_PROFILE_PATH")
+            or _env_value("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH")
         )
         hit_experts: list[int] = []
         miss_experts: list[int] = []
@@ -1239,14 +1235,8 @@ class MoeOffloadRuntime:
         queued_async_load = False
         collect_profile = bool(
             self.config.gmm_profile_path
-            or os.getenv(
-                "VLLM_ASCEND_MOE_GMM_PROFILE_PATH",
-                envs.VLLM_ASCEND_MOE_GMM_PROFILE_PATH,
-            )
-            or os.getenv(
-                "VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH",
-                envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH,
-            )
+            or _env_value("VLLM_ASCEND_MOE_GMM_PROFILE_PATH")
+            or _env_value("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH")
         )
         profile_ms: dict[str, float] = {}
 
@@ -1652,8 +1642,8 @@ class MoeOffloadRuntime:
     def _append_profile_event_jsonl(self, event: MoeOffloadProfileEvent) -> None:
         profile_path = (
             self.config.gmm_profile_path
-            or os.getenv("VLLM_ASCEND_MOE_GMM_PROFILE_PATH", envs.VLLM_ASCEND_MOE_GMM_PROFILE_PATH)
-            or os.getenv("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH", envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH)
+            or _env_value("VLLM_ASCEND_MOE_GMM_PROFILE_PATH")
+            or _env_value("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH")
         )
         if not profile_path:
             return
@@ -1665,8 +1655,8 @@ class MoeOffloadRuntime:
     def _append_trace_record_jsonl(self, record: TraceRecord) -> None:
         trace_path = (
             self.config.gmm_trace_path
-            or os.getenv("VLLM_ASCEND_MOE_GMM_TRACE_PATH", envs.VLLM_ASCEND_MOE_GMM_TRACE_PATH)
-            or os.getenv("VLLM_ASCEND_MOE_OFFLOAD_TRACE_PATH", envs.VLLM_ASCEND_MOE_OFFLOAD_TRACE_PATH)
+            or _env_value("VLLM_ASCEND_MOE_GMM_TRACE_PATH")
+            or _env_value("VLLM_ASCEND_MOE_OFFLOAD_TRACE_PATH")
         )
         if not trace_path:
             return

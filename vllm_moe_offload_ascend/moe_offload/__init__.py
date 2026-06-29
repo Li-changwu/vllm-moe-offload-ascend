@@ -16,6 +16,7 @@
 #
 
 from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
+from vllm_moe_offload_ascend.moe_offload.cpu_first_loader import CPU_FIRST_LOAD_ENV
 from vllm_moe_offload_ascend.moe_offload.expert_key import ExpertKey
 from vllm_moe_offload_ascend.moe_offload.host_store import ExpertWeightBundle, HostExpertStore
 from vllm_moe_offload_ascend.moe_offload.layout import LayoutSignature, LayoutValidator
@@ -47,6 +48,7 @@ from vllm_moe_offload_ascend.moe_offload.transfer_engine import TransferEngine
 
 __all__ = [
     "ExpertKey",
+    "CPU_FIRST_LOAD_ENV",
     "ExpertSlot",
     "ExpertSlotMapping",
     "ExpertSlotBank",

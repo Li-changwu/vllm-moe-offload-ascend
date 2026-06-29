@@ -89,6 +89,7 @@ class HostExpertStore:
         layer: torch.nn.Module,
         *,
         pin_memory: bool = False,
+        clone_tensors: bool = True,
     ) -> HostStoreRegisterReport:
         layer_id = int(getattr(layer, "layer_id", -1))
         w13_weight = getattr(layer, "w13_weight")
@@ -115,8 +116,8 @@ class HostExpertStore:
         pin_failures: list[str] = []
         layer_bundles: list[ExpertWeightBundle] = []
         for expert_id in range(num_experts):
-            w13 = w13_weight[expert_id].detach().cpu().clone()
-            w2 = w2_weight[expert_id].detach().cpu().clone()
+            w13 = _to_host_tensor(w13_weight[expert_id], clone=clone_tensors)
+            w2 = _to_host_tensor(w2_weight[expert_id], clone=clone_tensors)
             if pin_memory:
                 w13, w13_pinned, w13_error = _maybe_pin_tensor(w13)
                 w2, w2_pinned, w2_error = _maybe_pin_tensor(w2)
@@ -206,11 +207,24 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
 
 def _maybe_pin_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, bool, str | None]:
     try:
+        if hasattr(tensor, "is_pinned") and tensor.is_pinned():
+            return tensor, True, None
+    except Exception:
+        pass
+    try:
         pinned = tensor.pin_memory()
     except Exception as exc:
         return tensor, False, f"{type(exc).__name__}:{str(exc)[:120]}"
     is_pinned = bool(pinned.is_pinned()) if hasattr(pinned, "is_pinned") else True
     return pinned, is_pinned, None if is_pinned else "pin_memory_returned_unpinned"
+
+
+def _to_host_tensor(tensor: torch.Tensor, *, clone: bool) -> torch.Tensor:
+    host = tensor.detach()
+    if host.device.type != "cpu":
+        host = host.cpu()
+        clone = True
+    return host.clone() if clone else host
 
 
 def _expert_stride(tensor: torch.Tensor) -> tuple[int, ...]:

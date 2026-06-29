@@ -61,6 +61,7 @@ def _inject_sys_modules() -> None:
         "autoconfig",
         "compute_bucket",
         "config",
+        "cpu_first_loader",
         "expert_key",
         "expert_weight_release",
         "host_store",
@@ -522,6 +523,9 @@ def _patch_ascend_envs() -> None:
         ),
         "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL": lambda: _to_bool_env(
             "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL", "0"
+        ),
+        "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD": lambda: _to_bool_env(
+            "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD", "0"
         ),
         "VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY": lambda: (
             None
@@ -1996,7 +2000,54 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
     from vllm_moe_offload_ascend.moe_offload.runtime import (
         get_moe_offload_runtime,
     )
+    from vllm_moe_offload_ascend.moe_offload.cpu_first_loader import (
+        maybe_create_unquantized_cpu_first_weights,
+        maybe_process_unquantized_cpu_first_weights,
+    )
     from vllm_moe_offload_ascend.ops.fused_moe import moe_seam_inject
+
+    base_unquantized_cls = getattr(_fused_moe, "UnquantizedFusedMoEMethod", None)
+    if base_unquantized_cls is not None and not getattr(
+        base_unquantized_cls,
+        "_ascend_moe_offload_cpu_first_create_patch",
+        False,
+    ):
+        original_create_weights = base_unquantized_cls.create_weights
+
+        def create_weights(
+            self,
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        ):
+            runtime = get_moe_offload_runtime()
+            if maybe_create_unquantized_cpu_first_weights(
+                self,
+                layer,
+                runtime=runtime,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                params_dtype=params_dtype,
+                extra_weight_attrs=extra_weight_attrs,
+            ):
+                return None
+            return original_create_weights(
+                self,
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+
+        create_weights.__wrapped__ = original_create_weights
+        base_unquantized_cls.create_weights = create_weights
+        base_unquantized_cls._ascend_moe_offload_cpu_first_create_patch = True
 
     original_process_weights = cls.process_weights_after_loading
     original_apply = cls.apply
@@ -2035,8 +2086,14 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
     _fused_moe.select_experts = select_experts
 
     def process_weights_after_loading(self, layer):
-        result = original_process_weights(self, layer)
         runtime = get_moe_offload_runtime()
+        if maybe_process_unquantized_cpu_first_weights(
+            self,
+            layer,
+            runtime=runtime,
+        ):
+            return None
+        result = original_process_weights(self, layer)
         layer_id = int(getattr(layer, "layer_id", -1))
         if (
             runtime.should_use_fixed_slot_plan_for_layer(layer_id)

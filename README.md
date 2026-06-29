@@ -94,6 +94,14 @@ vllm serve <model> --trust-remote-code ...
 
 如果设置 `VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE=1`，表示启用 graph-compatible 的 SEW fixed-slot 数据通路；这条路径会主动拒绝原生 prefetch offload 参数。未启用 SEW 数据通路时，AutoConfig 的普通分层路径仍可能通过 vLLM PrefetchOffloader 保留 high-fanout full-weight fallback，这是 legacy/layered 路径的一部分，不应和 SEW fixed-slot 实验混为同一组对比。
 
+### CPU-first expert loading（实验）
+
+```bash
+export VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD=1
+```
+
+该开关用于大模型启动期：offloaded MoE 层的 expert 参数在 `create_weights` 阶段直接分配到 CPU host 内存，后续只按层短暂搬到 NPU 做 Ascend 格式化，再回落 CPU host store，避免“所有 expert 先完整加载到 NPU，再整体拷回 CPU”的启动峰值。当前第一阶段只覆盖 unquantized fixed-slot offloaded 层；resident 层、非 MoE 权重和暂未适配的量化 MoE 权重仍走原始加载路径。
+
 ### 验证插件已加载
 
 启动日志中应出现：
@@ -132,6 +140,7 @@ pip uninstall vllm-moe-offload-ascend
 | `VLLM_ASCEND_MOE_OFFLOAD_MIN_NET_SAVING_RATIO` | `0.25` | 自动推导 slots 时至少保留的净显存收益比例 |
 | `VLLM_ASCEND_MOE_OFFLOAD_MIN_NET_SAVING_GB` | 未设置 | 自动推导 slots 时至少保留的净显存收益 GiB 下限 |
 | `VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE` | `0` | 启用 SEW router-stage-MLP graph-compatible fixed-slot 数据通路 |
+| `VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD` | `0` | 实验开关；offloaded unquantized MoE expert 在初始化时直接落到 CPU host store，降低启动期 NPU 峰值 |
 | `VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH` | `1` | SEW B2 Prefill 软件流水预取深度 |
 | `VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT` | `2` | SEW B2 Prefill stage buffer 数 |
 | `VLLM_ASCEND_MOE_GMM_PROFILE_PATH` | 未设置 | MoE/GMM profile JSONL 输出路径 |

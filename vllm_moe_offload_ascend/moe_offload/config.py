@@ -56,6 +56,9 @@ class MoeOffloadConfig:
     # num_slots (capacity-bounded waves instead of fail-closed). Prefill+eager only;
     # decode keeps the single-wave B1 path. Default off.
     b2_wave_prefill: bool = False
+    # Stage-1 out-of-core loading: allocate offloaded experts on CPU during
+    # model init and never materialize the full expert tensors on NPU.
+    cpu_first_load: bool = False
     # Pin CPU expert tensors so async CPU->NPU copies can be host-nonblocking.
     # Defaults to async_load when the env var is absent.
     pin_host_memory: bool | None = None
@@ -98,6 +101,7 @@ class MoeOffloadConfig:
             graph_compatible_offload=envs.VLLM_ASCEND_MOE_OFFLOAD_GRAPH_COMPATIBLE,
             offload_stage_seam=envs.VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM,
             b2_wave_prefill=envs.VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL,
+            cpu_first_load=envs.VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD,
             pin_host_memory=envs.VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY,
             prefill_prefetch_depth=envs.VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH,
             prefill_buffer_count=envs.VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT,
