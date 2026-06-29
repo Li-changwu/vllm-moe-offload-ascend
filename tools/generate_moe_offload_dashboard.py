@@ -78,9 +78,21 @@ def _first_throughput(payload: dict[str, Any], source: Path) -> tuple[float, str
 
 
 def _required_float(payload: dict[str, Any], key: str, metric_name: str, source: Path) -> float:
-    if key not in payload:
-        raise ValueError(f"{source} is missing {metric_name}; expected key: {key}")
-    return _to_float(payload[key], metric_name, source)
+    if key in payload:
+        return _to_float(payload[key], metric_name, source)
+    nested_key = {
+        "median_ttft_ms": ("ttft_ms", "median"),
+        "median_tpot_ms": ("tpot_ms", "median"),
+    }.get(key)
+    if nested_key is not None:
+        current: Any = payload
+        for part in nested_key:
+            if not isinstance(current, dict) or part not in current:
+                break
+            current = current[part]
+        else:
+            return _to_float(current, metric_name, source)
+    raise ValueError(f"{source} is missing {metric_name}; expected key: {key}")
 
 
 def _parse_offload_gb(label: str, payload: dict[str, Any]) -> float | None:

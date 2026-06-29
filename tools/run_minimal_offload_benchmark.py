@@ -21,7 +21,7 @@ import torch_npu
 import yaml
 from vllm import LLM, SamplingParams
 
-from tools.sew_offload.sharegpt_manifest import (
+from tools.sharegpt_manifest import (
     assert_no_random_dataset,
     build_sharegpt_manifest,
 )
@@ -182,14 +182,20 @@ def _metrics_from_outputs(outputs: list[Any], duration_s: float) -> dict[str, An
             }
         )
 
+    ttft_summary = _summarize(ttfts_ms)
+    tpot_summary = _summarize(tpots_ms)
     return {
         "duration_s": duration_s,
         "completed": len(outputs),
         "total_output_tokens": output_tokens,
         "request_throughput_req_s": len(outputs) / duration_s if duration_s else 0.0,
+        "request_throughput": len(outputs) / duration_s if duration_s else 0.0,
         "output_throughput_tok_s": output_tokens / duration_s if duration_s else 0.0,
-        "ttft_ms": _summarize(ttfts_ms),
-        "tpot_ms": _summarize(tpots_ms),
+        "output_throughput": output_tokens / duration_s if duration_s else 0.0,
+        "median_ttft_ms": ttft_summary["median"],
+        "median_tpot_ms": tpot_summary["median"],
+        "ttft_ms": ttft_summary,
+        "tpot_ms": tpot_summary,
         "per_request": per_request,
     }
 

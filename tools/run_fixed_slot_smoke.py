@@ -20,12 +20,12 @@ from typing import Any
 import yaml
 from vllm import LLM, SamplingParams
 
-from tools.sew_offload.collect_moe_trace import (
+from tools.collect_moe_trace import (
     csv_set,
     load_manifest,
     prepare_sharegpt_manifest,
 )
-from tools.sew_offload.sharegpt_manifest import assert_no_random_dataset
+from tools.sharegpt_manifest import assert_no_random_dataset
 from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime, reset_moe_offload_runtime
 
 

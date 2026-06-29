@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 from vllm import LLM, SamplingParams
 
-from tools.sew_offload.sharegpt_manifest import (
+from tools.sharegpt_manifest import (
     assert_no_random_dataset,
     build_sharegpt_manifest,
 )

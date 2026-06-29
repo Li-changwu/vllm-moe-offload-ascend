@@ -16,6 +16,7 @@
 #
 
 from dataclasses import dataclass
+import os
 
 from vllm_ascend import envs
 from vllm_moe_offload_ascend.moe_offload.tiered_residency import (
@@ -41,6 +42,41 @@ class MoeOffloadConfig:
     fanout_threshold: int = 0
     # MVP-D.11: post-dispatch phase split semantic prototype (default off).
     phase_split_enabled: bool = False
+    # Option 2: graph-compatible offload via decision/execution decoupling.
+    # When on, capture uses the no-host-sync capture-safe slot plan so ACLGraph
+    # can record the MoE region; the data-dependent decision + H2D staging is
+    # done eager before replay. Default off => current eager-only behavior.
+    graph_compatible_offload: bool = False
+    # Regime B path ①: per-step staging seam (vllm::moe_offload_stage splitting
+    # op between router and grouped MLP). Supports num_slots < n. When on, the
+    # load-time full-residency hook is skipped for offloaded layers and staging
+    # happens per-step eager between captured pieces. Default off => Regime A.
+    offload_stage_seam: bool = False
+    # Regime B "B2": wave-streamed prefill when eager-prefill active union exceeds
+    # num_slots (capacity-bounded waves instead of fail-closed). Prefill+eager only;
+    # decode keeps the single-wave B1 path. Default off.
+    b2_wave_prefill: bool = False
+    # Pin CPU expert tensors so async CPU->NPU copies can be host-nonblocking.
+    # Defaults to async_load when the env var is absent.
+    pin_host_memory: bool | None = None
+    # B2 Prefill software pipeline knobs. Depth=1 with two buffers is the current
+    # double-buffer behavior; larger values are useful for measuring H2D/MLP
+    # overlap on workloads with short per-wave compute.
+    prefill_prefetch_depth: int = 1
+    prefill_buffer_count: int = 2
+    # P1-C scaffold: optional profiling-suite plan for stable grouped compute buckets.
+    compute_bucket_plan_path: str = ""
+    # Non-offload MoE GroupedMatmul diagnostics and plan inputs.
+    gmm_trace_path: str = ""
+    gmm_profile_path: str = ""
+    gmm_bucket_plan_path: str = ""
+    # Optional serving-shape hint used only to keep B2 overflow fallback narrow
+    # when vLLM profile/dummy prefill does not expose phase metadata.
+    max_num_seqs_hint: int = 0
+
+    def __post_init__(self) -> None:
+        if self.gmm_bucket_plan_path:
+            object.__setattr__(self, "compute_bucket_plan_path", self.gmm_bucket_plan_path)
 
     @classmethod
     def from_env(cls) -> "MoeOffloadConfig":
@@ -59,6 +95,22 @@ class MoeOffloadConfig:
             layered_runtime=envs.VLLM_ASCEND_MOE_OFFLOAD_LAYERED_RUNTIME,
             fanout_threshold=envs.VLLM_ASCEND_MOE_OFFLOAD_FANOUT_THRESHOLD,
             phase_split_enabled=envs.VLLM_ASCEND_MOE_OFFLOAD_PHASE_SPLIT,
+            graph_compatible_offload=envs.VLLM_ASCEND_MOE_OFFLOAD_GRAPH_COMPATIBLE,
+            offload_stage_seam=envs.VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM,
+            b2_wave_prefill=envs.VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL,
+            pin_host_memory=envs.VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY,
+            prefill_prefetch_depth=envs.VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH,
+            prefill_buffer_count=envs.VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT,
+            compute_bucket_plan_path=envs.VLLM_ASCEND_MOE_COMPUTE_BUCKET_PLAN_PATH,
+            gmm_trace_path=envs.VLLM_ASCEND_MOE_GMM_TRACE_PATH,
+            gmm_profile_path=envs.VLLM_ASCEND_MOE_GMM_PROFILE_PATH,
+            gmm_bucket_plan_path=envs.VLLM_ASCEND_MOE_GMM_BUCKET_PLAN_PATH,
+            max_num_seqs_hint=int(
+                os.getenv(
+                    "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT",
+                    "0",
+                )
+            ),
         )
 
     @property
@@ -73,7 +125,25 @@ class MoeOffloadConfig:
         return self.enabled and self.trace_only
 
     @property
+    def should_trace_gmm(self) -> bool:
+        return bool(self.gmm_trace_path) or self.should_trace
+
+    @property
     def effective_fanout_threshold(self) -> int:
         if self.fanout_threshold > 0:
             return self.fanout_threshold
         return self.num_slots
+
+    @property
+    def should_pin_host_memory(self) -> bool:
+        if self.pin_host_memory is None:
+            return bool(self.async_load)
+        return bool(self.pin_host_memory)
+
+    @property
+    def effective_prefill_prefetch_depth(self) -> int:
+        return max(0, int(self.prefill_prefetch_depth))
+
+    @property
+    def effective_prefill_buffer_count(self) -> int:
+        return max(1, int(self.prefill_buffer_count))

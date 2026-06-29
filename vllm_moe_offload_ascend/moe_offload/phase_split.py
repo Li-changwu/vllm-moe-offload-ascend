@@ -108,6 +108,146 @@ class MoEPhasePlan:
         }
 
 
+@dataclass(frozen=True)
+class B2WavePlan:
+    """Capacity-bounded prefill wave plan keyed by logical expert ids."""
+
+    waves: tuple[tuple[int, ...], ...]
+    token_counts_by_expert: dict[int, int]
+
+    @property
+    def active_expert_count(self) -> int:
+        return len(self.token_counts_by_expert)
+
+    @property
+    def total_pairs(self) -> int:
+        return sum(int(v) for v in self.token_counts_by_expert.values())
+
+    def wave_tokens(self, wave: tuple[int, ...]) -> int:
+        return sum(int(self.token_counts_by_expert.get(int(e), 0)) for e in wave)
+
+    def to_jsonable(self) -> dict[str, object]:
+        return {
+            "n_active": self.active_expert_count,
+            "n_pairs": self.total_pairs,
+            "n_waves": len(self.waves),
+            "waves": [
+                {
+                    "experts": [int(e) for e in wave],
+                    "tokens": self.wave_tokens(wave),
+                    "per_expert_tokens": {
+                        str(int(e)): int(self.token_counts_by_expert.get(int(e), 0))
+                        for e in wave
+                    },
+                }
+                for wave in self.waves
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class B2PrefillAsyncSchedule:
+    """Compute order plus early staging order for B2 prefill waves.
+
+    Compute order stays equal to the planner's wave order, preserving the
+    deterministic scatter-add path. Staging order contains only waves with at
+    least one miss, so their H2D can be issued before hit-only waves are
+    computed.
+    """
+
+    compute_order: tuple[int, ...]
+    hit_wave_indices: tuple[int, ...]
+    staged_wave_indices: tuple[int, ...]
+    staged_issue_order: tuple[int, ...]
+    prefetch_depth: int = 1
+    buffer_count: int = 2
+    initial_stage_count: int = 0
+
+    def to_jsonable(self) -> dict[str, object]:
+        return {
+            "compute_order": [int(i) for i in self.compute_order],
+            "hit_wave_indices": [int(i) for i in self.hit_wave_indices],
+            "staged_wave_indices": [int(i) for i in self.staged_wave_indices],
+            "staged_issue_order": [int(i) for i in self.staged_issue_order],
+            "prefetch_depth": int(self.prefetch_depth),
+            "buffer_count": int(self.buffer_count),
+            "initial_stage_count": int(self.initial_stage_count),
+        }
+
+
+@dataclass(frozen=True)
+class B2PairMicrobatch:
+    """A work-conserving wave microbatch of routed (token, expert) pairs."""
+
+    hidden_states: "torch.Tensor"
+    topk_ids: "torch.Tensor"
+    topk_weights: "torch.Tensor"
+    restore_token_indices: "torch.Tensor"
+    logical_expert_ids: "torch.Tensor"
+
+    @property
+    def num_pairs(self) -> int:
+        return int(self.restore_token_indices.numel())
+
+
+@dataclass(frozen=True)
+class B2RoutedPairIndex:
+    """Reusable routed-pair index for all B2 waves in one prefill layer call."""
+
+    topk_ids: "torch.Tensor"
+    topk_weights: "torch.Tensor"
+    num_tokens: int
+    top_k: int
+    pair_offsets_by_expert: dict[int, tuple[int, ...]]
+
+    @property
+    def total_pairs(self) -> int:
+        return sum(len(offsets) for offsets in self.pair_offsets_by_expert.values())
+
+
+@dataclass(frozen=True)
+class B2WaveMicrobatchPlan:
+    """Precomputed routed-pair tensors for one B2 wave."""
+
+    wave_experts: tuple[int, ...]
+    token_indices: "torch.Tensor"
+    topk_positions: "torch.Tensor"
+    logical_expert_ids: "torch.Tensor"
+    physical_slot_ids: "torch.Tensor"
+    top_k: int = 1
+    layer_pair_start: int = 0
+    layer_pair_end: int = 0
+    layer_token_indices: "torch.Tensor | None" = None
+    layer_topk_positions: "torch.Tensor | None" = None
+    layer_logical_expert_ids: "torch.Tensor | None" = None
+    layer_physical_slot_ids: "torch.Tensor | None" = None
+
+    @property
+    def num_pairs(self) -> int:
+        return int(self.token_indices.numel())
+
+    @property
+    def pair_offsets(self):
+        return self.token_indices * int(self.top_k) + self.topk_positions
+
+
+@dataclass(frozen=True)
+class B2DirectScatterPayload:
+    """Per-wave GMM output before AllGather token unpermute.
+
+    B2 pair waves force ``top_k=1`` and build a microbatch containing only the
+    routed pairs assigned to the wave.  The AllGather dispatcher's
+    ``expanded_row_idx`` is the unpermute index: ``abs(expanded_row_idx)[i]``
+    points to the permuted/GMM row for microbatch row ``i``. Layer-level scatter
+    can directly add those weighted microbatch rows into the full prefill output.
+    """
+
+    permuted_tokens: "torch.Tensor"
+    expanded_row_idx: "torch.Tensor"
+    topk_weights: "torch.Tensor"
+    restore_token_indices: "torch.Tensor"
+
+
 # ---------------------------------------------------------------------------
 # Expert token slicing from group_list
 # ---------------------------------------------------------------------------
@@ -243,6 +383,990 @@ def plan_hit_miss_phases(
     )
 
 
+def build_b2_wave_routing(
+    physical_topk_ids: "torch.Tensor",
+    topk_weights: "torch.Tensor",
+):
+    """B2 per-wave routing on the OFFLOAD path (log2phy-remapped topk_ids).
+
+    The offload dispatch path remaps ``topk_ids`` through the wave's ``log2phy``
+    buffer BEFORE this point: experts staged into this wave's slots get a valid
+    physical slot id (>=0); every other (non-wave) logical expert maps to -1.
+    Unlike the EP path, offload dispatch does NOT auto-zero dropped experts, so
+    here we make the wave self-contained:
+
+      * ``safe_ids`` = physical_topk_ids with -1 replaced by 0 (an in-range slot)
+        so ``npu_moe_init_routing`` never indexes out of bounds. Those tokens are
+        routed into slot 0 but contribute nothing because...
+      * ``masked_weights`` = topk_weights zeroed wherever physical id was -1, so
+        the combine (unpermute by probs) adds 0 for non-wave (token,expert) pairs.
+
+    Summing each wave's combined output reproduces the full MoE output (addition
+    over disjoint expert subsets), per the wave-accumulate keystone.
+
+    Returns ``(safe_ids, masked_weights)`` -- both same shape as the inputs.
+    """
+    import torch
+
+    kept = physical_topk_ids != -1
+    safe_ids = torch.where(kept, physical_topk_ids, torch.zeros_like(physical_topk_ids))
+    masked_weights = topk_weights * kept.to(topk_weights.dtype)
+    return safe_ids, masked_weights
+
+
+def count_routed_tokens_by_expert(topk_ids: "torch.Tensor") -> dict[int, int]:
+    """Count routed (token, top-k slot) pairs for each logical expert."""
+    if topk_ids.numel() == 0:
+        return {}
+
+    flat = topk_ids.detach().reshape(-1)
+    if flat.device.type != "cpu":
+        flat = flat.cpu()
+    unique, counts = flat.to(dtype=flat.dtype).unique(return_counts=True)
+    return {
+        int(expert_id): int(count)
+        for expert_id, count in zip(unique.tolist(), counts.tolist(), strict=True)
+        if int(expert_id) >= 0 and int(count) > 0
+    }
+
+
+def plan_balanced_b2_waves(
+    token_counts_by_expert: dict[int, int],
+    num_slots: int,
+    *,
+    slot_readiness: dict[int, bool] | None = None,
+) -> B2WavePlan:
+    """Plan capacity-bounded waves, balanced by routed token count.
+
+    Experts already present in slots are scheduled first so hit waves can start
+    computing before miss-heavy waves in future async variants. Within the hit
+    and miss groups, First-Fit Decreasing by routed pair count avoids packing
+    several hot experts into one long-tail wave.
+    """
+    if num_slots <= 0:
+        raise ValueError(f"num_slots must be greater than 0, got {num_slots}")
+
+    active = {
+        int(expert_id): int(count)
+        for expert_id, count in token_counts_by_expert.items()
+        if int(count) > 0
+    }
+    if not active:
+        return B2WavePlan(waves=(), token_counts_by_expert={})
+
+    readiness = slot_readiness or {}
+    def _pack(expert_ids: list[int]) -> list[list[int]]:
+        if not expert_ids:
+            return []
+        sorted_experts = sorted(
+            expert_ids,
+            key=lambda expert_id: (-active[int(expert_id)], int(expert_id)),
+        )
+        min_waves = (len(sorted_experts) + num_slots - 1) // num_slots
+        bins: list[list[int]] = [[] for _ in range(min_waves)]
+        bin_loads: list[int] = [0 for _ in range(min_waves)]
+        for expert_id in sorted_experts:
+            best_idx = None
+            best_load = None
+            for idx, wave in enumerate(bins):
+                if len(wave) >= num_slots:
+                    continue
+                load = bin_loads[idx]
+                if best_load is None or load < best_load:
+                    best_idx = idx
+                    best_load = load
+            if best_idx is None:
+                bins.append([int(expert_id)])
+                bin_loads.append(active[int(expert_id)])
+            else:
+                bins[best_idx].append(int(expert_id))
+                bin_loads[best_idx] += active[int(expert_id)]
+        return bins
+
+    hit_experts = [
+        int(expert_id)
+        for expert_id in active
+        if readiness.get(int(expert_id), False)
+    ]
+    miss_experts = [
+        int(expert_id)
+        for expert_id in active
+        if not readiness.get(int(expert_id), False)
+    ]
+
+    # Keep hit and miss experts in separate wave pools. Mixing one hit into many
+    # miss waves destroys the chance to run hit-only waves from the main slot
+    # cache later, and today it causes needless NPU->NPU copies into temp banks.
+    waves = tuple(tuple(wave) for wave in (_pack(hit_experts) + _pack(miss_experts)))
+    return B2WavePlan(waves=waves, token_counts_by_expert=active)
+
+
+def plan_b2_prefill_async_schedule(
+    waves: tuple[tuple[int, ...], ...],
+    *,
+    slot_readiness: dict[int, bool] | None = None,
+    prefetch_depth: int = 1,
+    buffer_count: int = 2,
+) -> B2PrefillAsyncSchedule:
+    """Plan staging order without changing B2 wave compute order.
+
+    Hit-only waves use the main slot cache and do not consume temp stage buffers.
+    Waves with any miss need temp staging, so they are listed in
+    ``staged_issue_order`` and can be primed before hit-only compute starts.
+    """
+    readiness = slot_readiness or {}
+    hit_wave_indices: list[int] = []
+    staged_wave_indices: list[int] = []
+    for wave_index, wave in enumerate(waves):
+        if all(readiness.get(int(expert_id), False) for expert_id in wave):
+            hit_wave_indices.append(int(wave_index))
+        else:
+            staged_wave_indices.append(int(wave_index))
+    effective_prefetch_depth = max(0, int(prefetch_depth))
+    effective_buffer_count = max(1, int(buffer_count))
+    initial_stage_count = min(
+        effective_prefetch_depth,
+        effective_buffer_count,
+        len(staged_wave_indices),
+    )
+
+    return B2PrefillAsyncSchedule(
+        compute_order=tuple(range(len(waves))),
+        hit_wave_indices=tuple(hit_wave_indices),
+        staged_wave_indices=tuple(staged_wave_indices),
+        staged_issue_order=tuple(staged_wave_indices),
+        prefetch_depth=effective_prefetch_depth,
+        buffer_count=effective_buffer_count,
+        initial_stage_count=initial_stage_count,
+    )
+
+
+def simulate_b2_prefill_issue_log(
+    schedule: B2PrefillAsyncSchedule,
+    *,
+    prefetch_depth: int | None = None,
+    buffer_count: int | None = None,
+) -> tuple[tuple[str, int], ...]:
+    """Return the issue/compute order for the B2 prefill async scheduler.
+
+    This pure helper mirrors the fused runtime loop without touching tensors or
+    streams. It is intentionally small, so tests can lock in the scheduling
+    invariant: miss waves are staged ahead, hit-only waves are issued lazily from
+    the main slot cache when their compute turn arrives.
+    """
+    log: list[tuple[str, int]] = []
+    staged_order = list(schedule.staged_issue_order)
+    staged_cursor = 0
+    issued: set[int] = set()
+    if prefetch_depth is None:
+        prefetch_depth = int(schedule.prefetch_depth)
+    if buffer_count is None:
+        buffer_count = int(schedule.buffer_count)
+    initial_stage_count = min(
+        max(prefetch_depth, 0),
+        max(buffer_count, 1),
+        len(staged_order),
+    )
+
+    stage_records: dict[int, int] = {}
+
+    def _next_free_buffer(current_buffer: int | None = None) -> int | None:
+        busy = set(stage_records.values())
+        if current_buffer is not None:
+            busy.add(int(current_buffer))
+        for buffer_index in range(max(buffer_count, 1)):
+            if buffer_index not in busy:
+                return int(buffer_index)
+        return None
+
+    def _issue_next_stage(current_buffer: int | None = None) -> bool:
+        nonlocal staged_cursor
+        if staged_cursor >= len(staged_order):
+            return False
+        buffer_index = _next_free_buffer(current_buffer)
+        if buffer_index is None:
+            return False
+        wave_index = int(staged_order[staged_cursor])
+        staged_cursor += 1
+        issued.add(wave_index)
+        stage_records[wave_index] = int(buffer_index)
+        log.append(("issue_stage", wave_index))
+        return True
+
+    while staged_cursor < initial_stage_count:
+        if not _issue_next_stage():
+            break
+
+    def _prefetch_ahead(current_buffer: int | None = None) -> None:
+        if prefetch_depth <= 0:
+            return
+        occupied_by_current = 1 if current_buffer is not None else 0
+        target_future = min(
+            max(prefetch_depth, 0),
+            max(buffer_count, 1) - occupied_by_current,
+        )
+        while len(stage_records) < target_future:
+            if not _issue_next_stage(current_buffer):
+                break
+
+    staged_wave_indices = set(int(i) for i in schedule.staged_wave_indices)
+    for wave_index in schedule.compute_order:
+        wave_index = int(wave_index)
+        if wave_index not in issued:
+            if wave_index in staged_wave_indices:
+                if not _issue_next_stage():
+                    raise RuntimeError(
+                        f"unable to issue staged wave {wave_index}; no buffer available"
+                    )
+            else:
+                issued.add(wave_index)
+                log.append(("issue_hit", wave_index))
+        current_buffer = stage_records.pop(wave_index, None)
+        _prefetch_ahead(current_buffer)
+        log.append(("compute", wave_index))
+        _prefetch_ahead()
+
+    return tuple(log)
+
+
+def build_b2_pair_microbatch(
+    hidden_states: "torch.Tensor",
+    topk_ids: "torch.Tensor",
+    topk_weights: "torch.Tensor",
+    logical_to_physical: "torch.Tensor",
+    wave_experts: tuple[int, ...],
+) -> B2PairMicrobatch:
+    """Build a top_k=1 routed-pair microbatch for one B2 wave.
+
+    The returned tensors contain only routed pairs whose logical expert belongs
+    to ``wave_experts``. ``topk_ids`` are remapped to physical fixed-slot ids and
+    shaped ``[num_pairs, 1]`` so dispatch/GMM/combine do no full-prompt masked
+    work for this wave.
+    """
+    import torch
+
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError(
+            "topk_ids and topk_weights must have identical shape, got "
+            f"{tuple(topk_ids.shape)} vs {tuple(topk_weights.shape)}"
+        )
+    if hidden_states.shape[0] != topk_ids.shape[0]:
+        raise ValueError(
+            "hidden_states and topk_ids disagree on token count, got "
+            f"{hidden_states.shape[0]} vs {topk_ids.shape[0]}"
+        )
+    if not wave_experts:
+        empty_idx = torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        return B2PairMicrobatch(
+            hidden_states=hidden_states.index_select(0, empty_idx),
+            topk_ids=torch.empty(0, 1, dtype=topk_ids.dtype, device=topk_ids.device),
+            topk_weights=torch.empty(0, 1, dtype=topk_weights.dtype, device=topk_weights.device),
+            restore_token_indices=empty_idx,
+            logical_expert_ids=torch.empty(0, dtype=topk_ids.dtype, device=topk_ids.device),
+        )
+
+    expert_tensor = torch.tensor(
+        [int(expert_id) for expert_id in wave_experts],
+        dtype=topk_ids.dtype,
+        device=topk_ids.device,
+    )
+    pair_mask = (topk_ids.unsqueeze(-1) == expert_tensor).any(dim=-1)
+    token_idx, topk_pos = torch.nonzero(pair_mask, as_tuple=True)
+
+    if token_idx.numel() == 0:
+        empty_idx = torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        return B2PairMicrobatch(
+            hidden_states=hidden_states.index_select(0, empty_idx),
+            topk_ids=torch.empty(0, 1, dtype=topk_ids.dtype, device=topk_ids.device),
+            topk_weights=torch.empty(0, 1, dtype=topk_weights.dtype, device=topk_weights.device),
+            restore_token_indices=empty_idx,
+            logical_expert_ids=torch.empty(0, dtype=topk_ids.dtype, device=topk_ids.device),
+        )
+
+    logical_ids = topk_ids[token_idx, topk_pos]
+    physical_ids = logical_to_physical[logical_ids]
+    # This invariant is useful when debugging wave planning, but the CPU sync
+    # required to prove it would serialize every prefill wave and break transfer
+    # / compute overlap. Keep it behind an explicit validation probe.
+    import os
+
+    if os.environ.get("SEW_B2_VALIDATE"):
+        if bool((physical_ids < 0).detach().cpu().any().item()):
+            missing = logical_ids[physical_ids < 0].detach().cpu().unique().tolist()
+            raise RuntimeError(f"B2 wave has unstaged experts in logical_to_physical: {missing}")
+
+    restore_token_indices = token_idx.to(device=hidden_states.device, dtype=torch.long)
+    return B2PairMicrobatch(
+        hidden_states=hidden_states.index_select(0, restore_token_indices).contiguous(),
+        topk_ids=physical_ids.reshape(-1, 1).contiguous(),
+        topk_weights=topk_weights[token_idx, topk_pos].reshape(-1, 1).contiguous(),
+        restore_token_indices=restore_token_indices,
+        logical_expert_ids=logical_ids.contiguous(),
+    )
+
+
+def build_b2_routed_pair_index(
+    topk_ids: "torch.Tensor",
+    topk_weights: "torch.Tensor",
+    *,
+    pair_offsets_by_expert: dict[int, tuple[int, ...]] | None = None,
+) -> B2RoutedPairIndex:
+    """Build a reusable routed-pair index for wave microbatch construction.
+
+    The original B2 microbatch builder re-scans ``topk_ids`` for every wave. In
+    prefill that means 7-10 full prompt scans per offloaded layer. This helper
+    builds the expert -> flat pair offsets map once; each wave then concatenates
+    the already-known offsets for its experts.
+    """
+    import torch
+
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError(
+            "topk_ids and topk_weights must have identical shape, got "
+            f"{tuple(topk_ids.shape)} vs {tuple(topk_weights.shape)}"
+        )
+    if topk_ids.ndim == 0:
+        raise ValueError("topk_ids must have at least one dimension")
+
+    top_k = int(topk_ids.shape[1]) if topk_ids.ndim > 1 else 1
+    num_tokens = int(topk_ids.shape[0])
+    if pair_offsets_by_expert is None:
+        flat = topk_ids.detach().reshape(-1)
+        if flat.device.type != "cpu":
+            flat = flat.cpu()
+        buckets: dict[int, list[int]] = {}
+        for pair_offset, expert_id in enumerate(flat.tolist()):
+            expert_id = int(expert_id)
+            if expert_id < 0:
+                continue
+            buckets.setdefault(expert_id, []).append(int(pair_offset))
+        pair_offsets_by_expert = {
+            int(expert_id): tuple(offsets)
+            for expert_id, offsets in buckets.items()
+            if offsets
+        }
+    else:
+        pair_offsets_by_expert = {
+            int(expert_id): tuple(int(offset) for offset in offsets)
+            for expert_id, offsets in pair_offsets_by_expert.items()
+            if offsets
+        }
+
+    max_offset = int(topk_ids.numel())
+    for expert_id, offsets in pair_offsets_by_expert.items():
+        for offset in offsets:
+            if offset < 0 or offset >= max_offset:
+                raise ValueError(
+                    f"pair offset {offset} for expert {expert_id} outside "
+                    f"topk_ids flat size {max_offset}"
+                )
+
+    return B2RoutedPairIndex(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        pair_offsets_by_expert=pair_offsets_by_expert,
+    )
+
+
+def build_b2_pair_microbatch_from_index(
+    hidden_states: "torch.Tensor",
+    pair_index: B2RoutedPairIndex,
+    logical_to_physical: "torch.Tensor",
+    wave_experts: tuple[int, ...],
+) -> B2PairMicrobatch:
+    """Build one B2 wave microbatch using a precomputed routed-pair index."""
+    import os
+    import torch
+
+    if hidden_states.shape[0] != pair_index.num_tokens:
+        raise ValueError(
+            "hidden_states and routed-pair index disagree on token count, got "
+            f"{hidden_states.shape[0]} vs {pair_index.num_tokens}"
+        )
+    if not wave_experts:
+        empty_idx = torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        return B2PairMicrobatch(
+            hidden_states=hidden_states.index_select(0, empty_idx),
+            topk_ids=torch.empty(0, 1, dtype=pair_index.topk_ids.dtype, device=pair_index.topk_ids.device),
+            topk_weights=torch.empty(0, 1, dtype=pair_index.topk_weights.dtype, device=pair_index.topk_weights.device),
+            restore_token_indices=empty_idx,
+            logical_expert_ids=torch.empty(0, dtype=pair_index.topk_ids.dtype, device=pair_index.topk_ids.device),
+        )
+
+    offsets: list[int] = []
+    for expert_id in wave_experts:
+        offsets.extend(pair_index.pair_offsets_by_expert.get(int(expert_id), ()))
+    offsets.sort()
+    if not offsets:
+        empty_idx = torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        return B2PairMicrobatch(
+            hidden_states=hidden_states.index_select(0, empty_idx),
+            topk_ids=torch.empty(0, 1, dtype=pair_index.topk_ids.dtype, device=pair_index.topk_ids.device),
+            topk_weights=torch.empty(0, 1, dtype=pair_index.topk_weights.dtype, device=pair_index.topk_weights.device),
+            restore_token_indices=empty_idx,
+            logical_expert_ids=torch.empty(0, dtype=pair_index.topk_ids.dtype, device=pair_index.topk_ids.device),
+        )
+
+    pair_offsets = torch.tensor(
+        offsets,
+        dtype=torch.long,
+        device=pair_index.topk_ids.device,
+    )
+    topk_pos = pair_offsets % int(pair_index.top_k)
+    token_idx = pair_offsets // int(pair_index.top_k)
+    logical_ids = pair_index.topk_ids.reshape(-1).index_select(0, pair_offsets)
+    physical_ids = logical_to_physical[logical_ids]
+
+    if os.environ.get("SEW_B2_VALIDATE"):
+        if bool((physical_ids < 0).detach().cpu().any().item()):
+            missing = logical_ids[physical_ids < 0].detach().cpu().unique().tolist()
+            raise RuntimeError(f"B2 wave has unstaged experts in logical_to_physical: {missing}")
+
+    restore_token_indices = token_idx.to(device=hidden_states.device, dtype=torch.long)
+    return B2PairMicrobatch(
+        hidden_states=hidden_states.index_select(0, restore_token_indices).contiguous(),
+        topk_ids=physical_ids.reshape(-1, 1).contiguous(),
+        topk_weights=pair_index.topk_weights[token_idx, topk_pos].reshape(-1, 1).contiguous(),
+        restore_token_indices=restore_token_indices,
+        logical_expert_ids=logical_ids.contiguous(),
+    )
+
+
+def build_b2_wave_microbatch_plan(
+    pair_index: B2RoutedPairIndex,
+    wave_experts: tuple[int, ...],
+    *,
+    physical_slot_by_expert: dict[int, int] | None = None,
+) -> B2WaveMicrobatchPlan:
+    """Precompute all wave-specific routed-pair tensors except log2phy remap."""
+    plans = build_b2_wave_microbatch_plans(
+        pair_index,
+        (wave_experts,),
+        physical_slot_by_expert=physical_slot_by_expert,
+    )
+    return plans[0]
+
+
+def build_b2_wave_microbatch_plans(
+    pair_index: B2RoutedPairIndex,
+    waves: tuple[tuple[int, ...], ...],
+    *,
+    physical_slot_by_expert: dict[int, int] | None = None,
+) -> tuple[B2WaveMicrobatchPlan, ...]:
+    """Precompute routed-pair tensors for all B2 waves with one device tensor.
+
+    Prefill B2 executes one layer as several expert waves. Building each wave
+    plan separately creates one small device tensor per wave and repeats the
+    same arithmetic kernels. This batched builder keeps each wave's sorted pair
+    order identical to :func:`build_b2_wave_microbatch_plan`, but concatenates
+    all offsets first so the hot path does one tensor materialization and slices
+    views for the individual wave plans. ``physical_slot_by_expert`` lets hit
+    waves reuse main-slot physical ids without building a full log2phy buffer;
+    experts not present in that mapping keep the temporary-wave slot id.
+    """
+    import torch
+
+    normalized_waves = tuple(tuple(int(e) for e in wave) for wave in waves)
+    physical_slots = (
+        {int(expert_id): int(slot_id) for expert_id, slot_id in physical_slot_by_expert.items()}
+        if physical_slot_by_expert is not None
+        else {}
+    )
+    wave_sizes: list[int] = []
+    all_token_indices: list[int] = []
+    all_topk_positions: list[int] = []
+    all_logical_ids: list[int] = []
+    all_slot_ids: list[int] = []
+    for wave in normalized_waves:
+        wave_pairs: list[tuple[int, int, int]] = []
+        for slot_id, expert_id in enumerate(wave):
+            wave_pairs.extend(
+                (
+                    int(offset),
+                    int(physical_slots.get(int(expert_id), int(slot_id))),
+                    int(expert_id),
+                )
+                for offset in pair_index.pair_offsets_by_expert.get(
+                    int(expert_id),
+                    (),
+                )
+            )
+        wave_pairs.sort(key=lambda item: item[0])
+        wave_sizes.append(len(wave_pairs))
+        for offset, slot_id, expert_id in wave_pairs:
+            all_token_indices.append(int(offset) // int(pair_index.top_k))
+            all_topk_positions.append(int(offset) % int(pair_index.top_k))
+            all_logical_ids.append(int(expert_id))
+            all_slot_ids.append(int(slot_id))
+
+    all_token_indices_tensor = torch.tensor(
+        all_token_indices,
+        dtype=torch.long,
+        device=pair_index.topk_ids.device,
+    )
+    all_topk_positions_tensor = torch.tensor(
+        all_topk_positions,
+        dtype=torch.long,
+        device=pair_index.topk_ids.device,
+    )
+    all_logical_ids_tensor = torch.tensor(
+        all_logical_ids,
+        dtype=pair_index.topk_ids.dtype,
+        device=pair_index.topk_ids.device,
+    )
+    all_physical_slot_ids = torch.tensor(
+        all_slot_ids,
+        dtype=pair_index.topk_ids.dtype,
+        device=pair_index.topk_ids.device,
+    )
+    if all_token_indices_tensor.numel() == 0:
+        empty_long = all_token_indices_tensor
+        empty_ids = torch.empty(
+            0,
+            dtype=pair_index.topk_ids.dtype,
+            device=pair_index.topk_ids.device,
+        )
+        return tuple(
+            B2WaveMicrobatchPlan(
+                wave_experts=wave,
+                token_indices=empty_long,
+                topk_positions=empty_long,
+                logical_expert_ids=empty_ids,
+                physical_slot_ids=empty_ids,
+                top_k=int(pair_index.top_k),
+                layer_pair_start=0,
+                layer_pair_end=0,
+                layer_token_indices=empty_long,
+                layer_topk_positions=empty_long,
+                layer_logical_expert_ids=empty_ids,
+                layer_physical_slot_ids=empty_ids,
+            )
+            for wave in normalized_waves
+        )
+
+    plans: list[B2WaveMicrobatchPlan] = []
+    cursor = 0
+    for wave, size in zip(normalized_waves, wave_sizes, strict=True):
+        end = cursor + size
+        plans.append(
+            B2WaveMicrobatchPlan(
+                wave_experts=wave,
+                token_indices=all_token_indices_tensor[cursor:end],
+                topk_positions=all_topk_positions_tensor[cursor:end],
+                logical_expert_ids=all_logical_ids_tensor[cursor:end],
+                physical_slot_ids=all_physical_slot_ids[cursor:end],
+                top_k=int(pair_index.top_k),
+                layer_pair_start=cursor,
+                layer_pair_end=end,
+                layer_token_indices=all_token_indices_tensor,
+                layer_topk_positions=all_topk_positions_tensor,
+                layer_logical_expert_ids=all_logical_ids_tensor,
+                layer_physical_slot_ids=all_physical_slot_ids,
+            )
+        )
+        cursor = end
+    return tuple(plans)
+
+
+def build_b2_pair_microbatch_from_plan(
+    hidden_states: "torch.Tensor",
+    topk_weights: "torch.Tensor",
+    logical_to_physical: "torch.Tensor | None",
+    plan: B2WaveMicrobatchPlan,
+) -> B2PairMicrobatch:
+    """Build one B2 wave microbatch from a precomputed wave plan.
+
+    ``logical_to_physical`` may be ``None`` for staged B2 waves because the temp
+    bank always assigns ``wave_experts[i]`` to physical slot ``i``. In that case
+    the plan's precomputed slot ids avoid all per-wave log2phy device writes.
+    """
+    import os
+    import torch
+
+    if plan.num_pairs == 0:
+        empty_idx = torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        topk_dtype = (
+            logical_to_physical.dtype
+            if logical_to_physical is not None
+            else plan.physical_slot_ids.dtype
+        )
+        topk_device = (
+            logical_to_physical.device
+            if logical_to_physical is not None
+            else plan.physical_slot_ids.device
+        )
+        return B2PairMicrobatch(
+            hidden_states=hidden_states.index_select(0, empty_idx),
+            topk_ids=torch.empty(0, 1, dtype=topk_dtype, device=topk_device),
+            topk_weights=torch.empty(0, 1, dtype=topk_weights.dtype, device=topk_weights.device),
+            restore_token_indices=empty_idx,
+            logical_expert_ids=torch.empty(0, dtype=plan.logical_expert_ids.dtype, device=plan.logical_expert_ids.device),
+        )
+
+    physical_ids = (
+        logical_to_physical[plan.logical_expert_ids]
+        if logical_to_physical is not None
+        else plan.physical_slot_ids
+    )
+    if os.environ.get("SEW_B2_VALIDATE"):
+        if bool((physical_ids < 0).detach().cpu().any().item()):
+            missing = plan.logical_expert_ids[physical_ids < 0].detach().cpu().unique().tolist()
+            raise RuntimeError(f"B2 wave has unstaged experts in logical_to_physical: {missing}")
+
+    restore_token_indices = plan.token_indices.to(device=hidden_states.device, dtype=torch.long)
+    return B2PairMicrobatch(
+        hidden_states=hidden_states.index_select(0, restore_token_indices).contiguous(),
+        topk_ids=physical_ids.reshape(-1, 1).contiguous(),
+        topk_weights=topk_weights[
+            plan.token_indices,
+            plan.topk_positions,
+        ].reshape(-1, 1).contiguous(),
+        restore_token_indices=restore_token_indices,
+        logical_expert_ids=plan.logical_expert_ids.contiguous(),
+    )
+
+
+def materialize_b2_pair_microbatches_from_plans(
+    hidden_states: "torch.Tensor",
+    topk_weights: "torch.Tensor",
+    plans: tuple[B2WaveMicrobatchPlan, ...],
+) -> tuple[B2PairMicrobatch, ...]:
+    """Materialize all wave pair microbatches with one layer-level gather.
+
+    The per-wave builder is semantically simple, but it launches small gathers
+    for every wave. Prefill usually has several waves per offloaded layer, so
+    this helper gathers all routed pair hidden states and router weights once,
+    then returns per-wave views. It preserves each wave's pair order and physical
+    slot ids from ``B2WaveMicrobatchPlan``.
+    """
+    import torch
+
+    if not plans:
+        return ()
+
+    total_pairs = sum(int(plan.num_pairs) for plan in plans)
+    if total_pairs == 0:
+        empty_idx = torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        microbatches: list[B2PairMicrobatch] = []
+        for plan in plans:
+            microbatches.append(
+                B2PairMicrobatch(
+                    hidden_states=hidden_states.index_select(0, empty_idx),
+                    topk_ids=torch.empty(
+                        0,
+                        1,
+                        dtype=plan.physical_slot_ids.dtype,
+                        device=plan.physical_slot_ids.device,
+                    ),
+                    topk_weights=torch.empty(
+                        0,
+                        1,
+                        dtype=topk_weights.dtype,
+                        device=topk_weights.device,
+                    ),
+                    restore_token_indices=empty_idx,
+                    logical_expert_ids=torch.empty(
+                        0,
+                        dtype=plan.logical_expert_ids.dtype,
+                        device=plan.logical_expert_ids.device,
+                    ),
+                )
+            )
+        return tuple(microbatches)
+
+    first_plan = plans[0]
+    can_reuse_layer_tensors = (
+        first_plan.layer_token_indices is not None
+        and first_plan.layer_topk_positions is not None
+        and first_plan.layer_physical_slot_ids is not None
+        and first_plan.layer_logical_expert_ids is not None
+        and int(first_plan.layer_pair_start) == 0
+        and int(plans[-1].layer_pair_end) == int(total_pairs)
+        and all(
+            plan.layer_token_indices is first_plan.layer_token_indices
+            and plan.layer_topk_positions is first_plan.layer_topk_positions
+            and plan.layer_physical_slot_ids is first_plan.layer_physical_slot_ids
+            and plan.layer_logical_expert_ids is first_plan.layer_logical_expert_ids
+            for plan in plans
+        )
+    )
+    if can_reuse_layer_tensors:
+        all_token_indices = first_plan.layer_token_indices
+        all_topk_positions = first_plan.layer_topk_positions
+        all_physical_slot_ids = first_plan.layer_physical_slot_ids
+        all_logical_expert_ids = first_plan.layer_logical_expert_ids
+    else:
+        all_token_indices = torch.cat(tuple(plan.token_indices for plan in plans))
+        all_topk_positions = torch.cat(tuple(plan.topk_positions for plan in plans))
+        all_physical_slot_ids = torch.cat(tuple(plan.physical_slot_ids for plan in plans))
+        all_logical_expert_ids = torch.cat(tuple(plan.logical_expert_ids for plan in plans))
+    restore_token_indices = all_token_indices.to(
+        device=hidden_states.device,
+        dtype=torch.long,
+    )
+    materialized_hidden = hidden_states.index_select(
+        0,
+        restore_token_indices,
+    ).contiguous()
+    materialized_topk_ids = all_physical_slot_ids.reshape(-1, 1).contiguous()
+    materialized_topk_weights = topk_weights[
+        all_token_indices,
+        all_topk_positions,
+    ].reshape(-1, 1).contiguous()
+
+    microbatches: list[B2PairMicrobatch] = []
+    cursor = 0
+    for plan in plans:
+        if can_reuse_layer_tensors:
+            start = int(plan.layer_pair_start)
+            end = int(plan.layer_pair_end)
+        else:
+            start = cursor
+            end = start + int(plan.num_pairs)
+            cursor = end
+        microbatches.append(
+            B2PairMicrobatch(
+                hidden_states=materialized_hidden[start:end],
+                topk_ids=materialized_topk_ids[start:end],
+                topk_weights=materialized_topk_weights[start:end],
+                restore_token_indices=restore_token_indices[start:end],
+                logical_expert_ids=all_logical_expert_ids[start:end],
+            )
+        )
+    return tuple(microbatches)
+
+
+def scatter_add_b2_pair_output(
+    full_output: "torch.Tensor",
+    pair_output: "torch.Tensor",
+    restore_token_indices: "torch.Tensor",
+) -> "torch.Tensor":
+    """Accumulate pair-level wave output back to full token output."""
+    if pair_output.numel() == 0:
+        return full_output
+    full_output.index_add_(0, restore_token_indices.to(full_output.device), pair_output)
+    return full_output
+
+
+def scatter_add_b2_pair_outputs(
+    full_output: "torch.Tensor",
+    pair_outputs: tuple["torch.Tensor", ...],
+    restore_token_indices: tuple["torch.Tensor", ...],
+) -> "torch.Tensor":
+    """Accumulate several wave outputs with one index_add_ when possible."""
+    if len(pair_outputs) != len(restore_token_indices):
+        raise ValueError(
+            "pair_outputs and restore_token_indices must have the same length, "
+            f"got {len(pair_outputs)} vs {len(restore_token_indices)}"
+        )
+    non_empty = [
+        (output, indices)
+        for output, indices in zip(pair_outputs, restore_token_indices, strict=True)
+        if output.numel() > 0
+    ]
+    if not non_empty:
+        return full_output
+    if len(non_empty) == 1:
+        output, indices = non_empty[0]
+        return scatter_add_b2_pair_output(full_output, output, indices)
+
+    import torch
+
+    outputs = torch.cat(tuple(output for output, _ in non_empty), dim=0)
+    indices = torch.cat(
+        tuple(indices.to(full_output.device) for _, indices in non_empty),
+        dim=0,
+    )
+    full_output.index_add_(0, indices, outputs)
+    return full_output
+
+
+def direct_scatter_add_b2_permuted_output(
+    full_output: "torch.Tensor",
+    *,
+    permuted_tokens: "torch.Tensor",
+    expanded_row_idx: "torch.Tensor",
+    topk_weights: "torch.Tensor",
+    restore_token_indices: "torch.Tensor",
+) -> "torch.Tensor":
+    """Fuse AllGather top_k=1 unpermute with B2 scatter-add.
+
+    For the AllGather dispatcher in B2 waves we force ``top_k=1`` and pass a
+    microbatch containing only routed pairs in the wave. ``expanded_row_idx``
+    is the same unpermute index consumed by ``npu_moe_token_unpermute``:
+    ``abs(expanded_row_idx)[i]`` points to the permuted/GMM row for microbatch
+    row ``i``. We gather those rows, multiply by router weights, and index-add
+    directly into the full prefill output, avoiding a separate wave-local output
+    tensor.
+    """
+    import torch
+
+    if permuted_tokens.numel() == 0:
+        return full_output
+
+    expanded = expanded_row_idx.reshape(-1).abs().to(
+        device=permuted_tokens.device,
+        dtype=torch.long,
+    )
+    weights = topk_weights.reshape(-1).to(
+        device=permuted_tokens.device,
+        dtype=permuted_tokens.dtype,
+    )
+    gathered = permuted_tokens.index_select(0, expanded)
+    weighted = gathered * weights.unsqueeze(-1)
+    full_output.index_add_(
+        0,
+        restore_token_indices.to(full_output.device),
+        weighted.to(full_output.device),
+    )
+    return full_output
+
+
+def direct_scatter_add_b2_permuted_outputs(
+    full_output: "torch.Tensor",
+    payloads: tuple[B2DirectScatterPayload, ...],
+) -> "torch.Tensor":
+    """Batch direct B2 unpermute/scatter for all waves in one layer.
+
+    This is the work-conserving counterpart to ``scatter_add_b2_pair_outputs``:
+    instead of materializing one wave-local combined output per wave, it offsets
+    every wave-local unpermute index into one concatenated permuted-token buffer,
+    applies the top-k weights once, and performs one layer-level ``index_add_``.
+    """
+    non_empty = [payload for payload in payloads if payload.permuted_tokens.numel() > 0]
+    if not non_empty:
+        return full_output
+
+    if len(non_empty) == 1:
+        payload = non_empty[0]
+        return direct_scatter_add_b2_permuted_output(
+            full_output,
+            permuted_tokens=payload.permuted_tokens,
+            expanded_row_idx=payload.expanded_row_idx,
+            topk_weights=payload.topk_weights,
+            restore_token_indices=payload.restore_token_indices,
+        )
+
+    import torch
+
+    weighted_chunks = []
+    restore_chunks = []
+    for payload in non_empty:
+        expanded = payload.expanded_row_idx.reshape(-1).abs().to(
+            device=payload.permuted_tokens.device,
+            dtype=torch.long,
+        )
+        weights = payload.topk_weights.reshape(-1).to(
+            device=payload.permuted_tokens.device,
+            dtype=payload.permuted_tokens.dtype,
+        )
+        gathered = payload.permuted_tokens.index_select(0, expanded)
+        weighted_chunks.append(
+            (gathered * weights.unsqueeze(-1)).to(full_output.device)
+        )
+        restore_chunks.append(payload.restore_token_indices.to(full_output.device))
+
+    if not weighted_chunks:
+        return full_output
+    full_output.index_add_(
+        0,
+        torch.cat(tuple(restore_chunks), dim=0),
+        torch.cat(tuple(weighted_chunks), dim=0),
+    )
+    return full_output
+
+
+def build_wave_expert_map(
+    wave_logical_experts: tuple[int, ...],
+    num_logical_experts: int,
+) -> "torch.Tensor":
+    """Build a per-wave ``expert_map`` for B2 wave-streamed prefill.
+
+    The AllGather token dispatcher drops experts whose ``expert_map`` entry is -1
+    (``mask = expert_map[topk_ids] != -1; topk_weights = topk_weights * mask``).
+    For one wave we therefore map ONLY that wave's logical experts to physical slot
+    positions ``0..k-1`` (their order within the wave) and map every other logical
+    expert to -1. Running dispatch->matmul->combine with this map computes exactly
+    that wave's ``(token, expert)`` contributions (others contribute 0); summing
+    across waves reproduces the full MoE output (see the wave-accumulate keystone).
+
+    Returns an int32 tensor of shape ``[num_logical_experts]``.
+    """
+    import torch
+
+    expert_map = torch.full((int(num_logical_experts),), -1, dtype=torch.int32)
+    for slot_position, logical_expert in enumerate(wave_logical_experts):
+        expert_map[int(logical_expert)] = slot_position
+    return expert_map
+
+
+def plan_capacity_bounded_phases(
+    expert_slices: list[tuple[int, int]],
+    active_expert_ids: tuple[int, ...],
+    num_slots: int,
+) -> MoEPhasePlan:
+    """B2: split active experts into capacity-bounded waves of <= num_slots each.
+
+    Unlike :func:`plan_hit_miss_phases` (which splits on slot *readiness*), this
+    planner splits on slot *capacity*: when an offloaded layer's active expert
+    set exceeds ``num_slots`` (the fixed HBM slot budget), a single grouped
+    matmul cannot run because not all experts can be resident at once. We instead
+    emit ``ceil(N / num_slots)`` waves, each covering a contiguous chunk of at
+    most ``num_slots`` experts. The executor stages each wave's experts into the
+    slot bank (eager prefill only), runs a partial grouped matmul over just that
+    wave's tokens, and scatters the result back. Because every token belongs to
+    exactly one expert and every expert to exactly one wave, the per-wave scatters
+    are disjoint and cover all tokens -> the concatenated result is element-wise
+    identical to a single-phase run.
+
+    Parameters mirror :func:`plan_hit_miss_phases`: ``expert_slices[i]`` is the
+    ``(start, end)`` token range for ``active_expert_ids[i]`` in the sorted hidden
+    states. ``num_slots`` is the per-layer fixed slot count.
+
+    Waves are marked ``is_hit=False`` because every wave requires staging (no wave
+    is resident up front under B2's capacity pressure).
+    """
+    if num_slots <= 0:
+        raise ValueError(f"num_slots must be greater than 0, got {num_slots}")
+    if len(active_expert_ids) != len(expert_slices):
+        raise ValueError(
+            f"Mismatched lengths: active_expert_ids={len(active_expert_ids)}, "
+            f"expert_slices={len(expert_slices)}"
+        )
+
+    total_tokens = sum(end - start for start, end in expert_slices)
+
+    # Fits in one wave -> degenerate to a single phase (same as B1's slot path).
+    if len(active_expert_ids) <= num_slots:
+        return _build_single_phase_plan(
+            expert_slices, active_expert_ids, reason="capacity_single_wave"
+        )
+
+    phases: list[MoEPhase] = []
+    for wave_index, start in enumerate(range(0, len(active_expert_ids), num_slots)):
+        chunk_ids = active_expert_ids[start : start + num_slots]
+        chunk_slices = tuple(expert_slices[start : start + num_slots])
+        phases.append(
+            MoEPhase(
+                phase_index=wave_index,
+                expert_indices=tuple(int(e) for e in chunk_ids),
+                token_slices=chunk_slices,
+                is_hit=False,
+            )
+        )
+
+    return MoEPhasePlan(
+        phases=tuple(phases),
+        total_phases=len(phases),
+        hit_phases=0,
+        miss_phases=len(phases),
+        total_tokens=total_tokens,
+        reason="capacity_bounded_waves",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Partial MLP execution helpers
 # ---------------------------------------------------------------------------
@@ -347,11 +1471,75 @@ def _scatter_phase_output(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Wave staging interface (overlap-ready: separates transfer from compute)
+# ---------------------------------------------------------------------------
+
+
+class WaveStager:
+    """Two-phase staging contract for capacity-bounded waves.
+
+    The contract deliberately splits "move this wave's experts into HBM" into two
+    calls so the executor can pipeline transfer (MTE) against compute (Cube):
+
+      * ``issue(wave_index, expert_indices)`` -- start staging the wave's experts
+        into a fixed slot buffer. May be asynchronous (return before the H2D copy
+        finishes); the serial implementation does it synchronously.
+      * ``wait(wave_index)`` -- block until that wave's slots are READY to be read
+        by the grouped matmul. The serial implementation is a no-op (issue already
+        finished the copy).
+
+    A serial (``prefetch_depth=0``) run calls ``issue`` then ``wait`` then compute
+    for each wave in turn -> identical to the original single-buffer staging. An
+    overlapped run (``prefetch_depth>=1``, double/N-buffered) issues wave k+1
+    BEFORE computing wave k, so the next wave's H2D rides under the current wave's
+    matmul. ``buffer_count`` declares how many waves may be in flight; the executor
+    guarantees it never issues a wave into a buffer whose prior occupant has not
+    yet been consumed (so a single-buffer stager is never asked to overlap).
+
+    This base class is the serial reference. NPU async (separate transfer stream +
+    SetFlag/WaitFlag) is a drop-in subclass that overrides issue/wait -- no change
+    to the executor or the planner.
+    """
+
+    #: How many waves may be resident concurrently. 1 == single buffer (serial).
+    buffer_count: int = 1
+
+    def issue(self, wave_index: int, expert_indices: tuple[int, ...]) -> None:
+        raise NotImplementedError
+
+    def wait(self, wave_index: int) -> None:
+        raise NotImplementedError
+
+
+class _CallbackWaveStager(WaveStager):
+    """Serial stager adapting the simple ``stage_wave_fn(expert_indices)`` callback.
+
+    ``issue`` runs the callback synchronously (the H2D completes before it
+    returns); ``wait`` is a no-op. ``buffer_count=1`` so the executor keeps strict
+    serial order -- preserving the original ``stage_wave_fn`` semantics exactly.
+    """
+
+    buffer_count = 1
+
+    def __init__(self, stage_wave_fn):
+        self._stage_wave_fn = stage_wave_fn
+
+    def issue(self, wave_index: int, expert_indices: tuple[int, ...]) -> None:
+        self._stage_wave_fn(expert_indices)
+
+    def wait(self, wave_index: int) -> None:
+        return None
+
+
 def execute_phased_mlp(
     *,
     mlp_compute_input: "MoEMlpComputeInput",
     phase_plan: MoEPhasePlan,
     _apply_mlp_fn=None,
+    stage_wave_fn=None,
+    wave_stager=None,
+    prefetch_depth: int = 0,
 ) -> "torch.Tensor":
     """Execute MoE MLP in phases according to *phase_plan*.
 
@@ -368,6 +1556,23 @@ def execute_phased_mlp(
     _apply_mlp_fn:
         Callable ``(MoEMlpComputeInput) -> Tensor``.  Defaults to
         ``unified_apply_mlp``.
+    stage_wave_fn:
+        Optional callable ``(expert_indices: tuple[int, ...]) -> None`` invoked
+        before each non-empty phase's MLP, used by B2 capacity-bounded waves to
+        stage that wave's experts into the fixed slot bank (eager prefill only).
+        ``None`` (default) preserves the original behavior: weights are assumed
+        already resident. Wrapped in a serial ``_CallbackWaveStager``. Mutually
+        exclusive with ``wave_stager``.
+    wave_stager:
+        Optional :class:`WaveStager` giving the overlap-ready two-phase
+        (issue/wait) staging contract. Lets a subclass run transfer on a separate
+        stream so wave k+1's H2D overlaps wave k's matmul. ``buffer_count`` caps
+        in-flight waves.
+    prefetch_depth:
+        How many waves to issue ahead of the one being computed. ``0`` (default)
+        == serial (issue, wait, compute per wave). ``>=1`` enables software
+        pipelining; clamped so issued-ahead waves never exceed the stager's
+        ``buffer_count`` (no buffer is reused before its wave is consumed).
 
     Returns
     -------
@@ -375,13 +1580,19 @@ def execute_phased_mlp(
     """
     import torch
 
+    if stage_wave_fn is not None and wave_stager is not None:
+        raise ValueError("pass at most one of stage_wave_fn / wave_stager")
+    if wave_stager is None and stage_wave_fn is not None:
+        wave_stager = _CallbackWaveStager(stage_wave_fn)
+
     if _apply_mlp_fn is None:
         from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp as _default
 
         _apply_mlp_fn = _default
 
-    # Single phase → fast-path (no slicing overhead).
-    if phase_plan.total_phases == 1:
+    # Single phase → fast-path (no slicing overhead). Skipped when a stager is
+    # present: B2 needs the per-wave stage call to run even for a lone wave.
+    if phase_plan.total_phases == 1 and wave_stager is None:
         return _apply_mlp_fn(mlp_compute_input=mlp_compute_input)
 
     from vllm_ascend.ops.fused_moe.moe_stage_contracts import MoEMlpComputeInput as _MoEMlpComputeInput
@@ -400,19 +1611,13 @@ def execute_phased_mlp(
         device=device,
     )
 
-    for phase in phase_plan.phases:
-        if phase.total_tokens == 0:
-            continue
+    # Only non-empty waves participate (0-token waves are pure no-ops).
+    waves = [p for p in phase_plan.phases if p.total_tokens > 0]
 
-        # Extract tokens
+    def _compute_wave(phase) -> None:
         phase_hidden = _extract_phase_tokens(hidden_states, phase.token_slices)
-
-        # Build phase group_list
         phase_group_list = _build_phase_group_list(group_list, group_list_type, phase.expert_indices)
-
-        # Slice weights
         phase_weights = _slice_expert_weights(mlp_compute_input.weights, phase.expert_indices)
-
         phase_input = _MoEMlpComputeInput(
             hidden_states=phase_hidden,
             group_list=phase_group_list,
@@ -426,11 +1631,32 @@ def execute_phased_mlp(
             need_trans=mlp_compute_input.need_trans,
             dynamic_eplb=mlp_compute_input.dynamic_eplb,
         )
-
         phase_output = _apply_mlp_fn(mlp_compute_input=phase_input)
-
-        # Scatter back
         _scatter_phase_output(full_output, phase_output, phase.token_slices)
+
+    if wave_stager is None:
+        # No staging contract: plain per-wave compute (weights already resident).
+        for phase in waves:
+            _compute_wave(phase)
+        return full_output
+
+    # Software-pipelined staging. ``ahead`` = how many waves are issued but not yet
+    # computed; capped by both prefetch_depth and the stager's buffer_count so a
+    # buffer is never reused while its wave is still in flight (correctness guard
+    # that lets a single-buffer/serial stager stay strictly serial).
+    max_in_flight = min(max(prefetch_depth, 0) + 1, max(wave_stager.buffer_count, 1))
+    issued = 0
+    # Prime: issue the first ``max_in_flight`` waves.
+    while issued < min(max_in_flight, len(waves)):
+        wave_stager.issue(issued, waves[issued].expert_indices)
+        issued += 1
+    for compute_idx in range(len(waves)):
+        wave_stager.wait(compute_idx)
+        _compute_wave(waves[compute_idx])
+        # After consuming this wave's buffer, issue the next not-yet-issued wave.
+        if issued < len(waves):
+            wave_stager.issue(issued, waves[issued].expert_indices)
+            issued += 1
 
     return full_output
 

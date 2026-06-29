@@ -55,12 +55,41 @@ class HostStoreCompletenessReport:
     blockers: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class HostStoreRegisterReport:
+    layer_id: int
+    num_experts: int
+    pin_memory_requested: bool
+    pinned_tensors: int
+    pin_failures: tuple[str, ...]
+
+    @property
+    def pin_memory_enabled(self) -> bool:
+        return self.pin_memory_requested and not self.pin_failures
+
+    def to_jsonable(self) -> dict[str, object]:
+        return {
+            "layer_id": int(self.layer_id),
+            "num_experts": int(self.num_experts),
+            "pin_memory_requested": bool(self.pin_memory_requested),
+            "pin_memory_enabled": bool(self.pin_memory_enabled),
+            "pinned_tensors": int(self.pinned_tensors),
+            "pin_failures": list(self.pin_failures),
+        }
+
+
 class HostExpertStore:
     def __init__(self) -> None:
         self._weights: dict[ExpertKey, ExpertWeightBundle] = {}
+        self._weights_by_layer: dict[int, tuple[ExpertWeightBundle, ...]] = {}
         self._layer_signatures: dict[int, HostExpertLayerSignature] = {}
 
-    def register_layer(self, layer: torch.nn.Module) -> None:
+    def register_layer(
+        self,
+        layer: torch.nn.Module,
+        *,
+        pin_memory: bool = False,
+    ) -> HostStoreRegisterReport:
         layer_id = int(getattr(layer, "layer_id", -1))
         w13_weight = getattr(layer, "w13_weight")
         w2_weight = getattr(layer, "w2_weight")
@@ -71,6 +100,7 @@ class HostExpertStore:
         if num_experts <= 0:
             raise ValueError("host expert store requires at least one expert")
         self._weights = {key: bundle for key, bundle in self._weights.items() if key.layer_id != layer_id}
+        self._weights_by_layer.pop(layer_id, None)
         self._layer_signatures[layer_id] = HostExpertLayerSignature(
             layer_id=layer_id,
             num_experts=num_experts,
@@ -81,17 +111,44 @@ class HostExpertStore:
             w2_dtype=w2_weight.dtype,
             w2_stride=_expert_stride(w2_weight),
         )
+        pinned_tensors = 0
+        pin_failures: list[str] = []
+        layer_bundles: list[ExpertWeightBundle] = []
         for expert_id in range(num_experts):
+            w13 = w13_weight[expert_id].detach().cpu().clone()
+            w2 = w2_weight[expert_id].detach().cpu().clone()
+            if pin_memory:
+                w13, w13_pinned, w13_error = _maybe_pin_tensor(w13)
+                w2, w2_pinned, w2_error = _maybe_pin_tensor(w2)
+                pinned_tensors += int(w13_pinned) + int(w2_pinned)
+                if w13_error is not None:
+                    pin_failures.append(f"expert={expert_id},w13:{w13_error}")
+                if w2_error is not None:
+                    pin_failures.append(f"expert={expert_id},w2:{w2_error}")
             bundle = ExpertWeightBundle(
                 layer_id=layer_id,
                 expert_id=expert_id,
-                w13=w13_weight[expert_id].detach().cpu().clone(),
-                w2=w2_weight[expert_id].detach().cpu().clone(),
+                w13=w13,
+                w2=w2,
             )
             self._weights[bundle.key] = bundle
+            layer_bundles.append(bundle)
+        self._weights_by_layer[layer_id] = tuple(layer_bundles)
+        return HostStoreRegisterReport(
+            layer_id=layer_id,
+            num_experts=num_experts,
+            pin_memory_requested=bool(pin_memory),
+            pinned_tensors=pinned_tensors,
+            pin_failures=tuple(pin_failures[:8]),
+        )
 
     def get(self, layer_id: int, expert_id: int) -> ExpertWeightBundle:
-        return self._weights[ExpertKey(int(layer_id), int(expert_id))]
+        normalized_layer_id = int(layer_id)
+        normalized_expert_id = int(expert_id)
+        layer_bundles = self._weights_by_layer.get(normalized_layer_id)
+        if layer_bundles is not None:
+            return layer_bundles[normalized_expert_id]
+        return self._weights[ExpertKey(normalized_layer_id, normalized_expert_id)]
 
     def validate_complete_layers(self, expected_layer_ids: tuple[int, ...]) -> HostStoreCompletenessReport:
         normalized_layer_ids = tuple(int(layer_id) for layer_id in expected_layer_ids)
@@ -145,6 +202,15 @@ class HostExpertStore:
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _maybe_pin_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, bool, str | None]:
+    try:
+        pinned = tensor.pin_memory()
+    except Exception as exc:
+        return tensor, False, f"{type(exc).__name__}:{str(exc)[:120]}"
+    is_pinned = bool(pinned.is_pinned()) if hasattr(pinned, "is_pinned") else True
+    return pinned, is_pinned, None if is_pinned else "pin_memory_returned_unpinned"
 
 
 def _expert_stride(tensor: torch.Tensor) -> tuple[int, ...]:

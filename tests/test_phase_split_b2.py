@@ -1,0 +1,720 @@
+import torch
+import pytest
+
+from vllm_moe_offload_ascend.moe_offload.phase_split import (
+    B2DirectScatterPayload,
+    build_b2_pair_microbatch,
+    build_b2_pair_microbatch_from_index,
+    build_b2_pair_microbatch_from_plan,
+    build_b2_routed_pair_index,
+    build_b2_wave_microbatch_plan,
+    build_b2_wave_microbatch_plans,
+    count_routed_tokens_by_expert,
+    direct_scatter_add_b2_permuted_output,
+    direct_scatter_add_b2_permuted_outputs,
+    materialize_b2_pair_microbatches_from_plans,
+    plan_b2_prefill_async_schedule,
+    plan_balanced_b2_waves,
+    scatter_add_b2_pair_output,
+    scatter_add_b2_pair_outputs,
+    simulate_b2_prefill_issue_log,
+)
+
+
+def test_count_routed_tokens_by_expert_counts_topk_pairs():
+    topk_ids = torch.tensor(
+        [
+            [1, 3],
+            [3, 4],
+            [1, 4],
+            [7, 3],
+        ],
+        dtype=torch.int32,
+    )
+
+    assert count_routed_tokens_by_expert(topk_ids) == {
+        1: 2,
+        3: 3,
+        4: 2,
+        7: 1,
+    }
+
+
+def test_plan_balanced_b2_waves_prefers_hits_and_balances_hot_experts():
+    plan = plan_balanced_b2_waves(
+        {1: 10, 2: 9, 3: 8, 4: 1, 5: 1},
+        num_slots=2,
+        slot_readiness={3: True},
+    )
+
+    assert all(len(wave) <= 2 for wave in plan.waves)
+    assert plan.waves[0][0] == 3
+    loads = [plan.wave_tokens(wave) for wave in plan.waves]
+    assert max(loads) - min(loads) <= 8
+
+
+def test_plan_balanced_b2_waves_keeps_hit_and_miss_pools_separate():
+    readiness = {1: True, 2: True, 3: True, 4: True, 5: True}
+    plan = plan_balanced_b2_waves(
+        {1: 10, 2: 9, 3: 8, 4: 7, 5: 6, 6: 5, 7: 4, 8: 3, 9: 2},
+        num_slots=4,
+        slot_readiness=readiness,
+    )
+
+    hit_waves = []
+    miss_waves = []
+    mixed_waves = []
+    for wave in plan.waves:
+        hits = [expert_id for expert_id in wave if readiness.get(expert_id, False)]
+        misses = [expert_id for expert_id in wave if not readiness.get(expert_id, False)]
+        if hits and misses:
+            mixed_waves.append(wave)
+        elif hits:
+            hit_waves.append(wave)
+        else:
+            miss_waves.append(wave)
+
+    assert hit_waves
+    assert miss_waves
+    assert not mixed_waves
+    assert all(len(wave) <= 4 for wave in plan.waves)
+
+
+def test_plan_b2_prefill_async_schedule_primes_miss_waves_without_changing_compute_order():
+    waves = ((1, 2), (3,), (4, 5), (6,))
+    readiness = {
+        1: True,
+        2: True,
+        3: True,
+        4: False,
+        5: False,
+        6: False,
+    }
+
+    schedule = plan_b2_prefill_async_schedule(waves, slot_readiness=readiness)
+
+    assert schedule.compute_order == (0, 1, 2, 3)
+    assert schedule.hit_wave_indices == (0, 1)
+    assert schedule.staged_wave_indices == (2, 3)
+    assert schedule.staged_issue_order == (2, 3)
+    assert schedule.prefetch_depth == 1
+    assert schedule.buffer_count == 2
+    assert schedule.initial_stage_count == 1
+    assert schedule.to_jsonable()["staged_issue_order"] == [2, 3]
+
+
+def test_plan_b2_prefill_async_schedule_clamps_prime_count_by_depth_and_buffers():
+    waves = ((1,), (2,), (3,), (4,), (5,))
+    readiness = {1: True, 2: False, 3: False, 4: False, 5: False}
+
+    schedule = plan_b2_prefill_async_schedule(
+        waves,
+        slot_readiness=readiness,
+        prefetch_depth=2,
+        buffer_count=3,
+    )
+
+    assert schedule.staged_issue_order == (1, 2, 3, 4)
+    assert schedule.prefetch_depth == 2
+    assert schedule.buffer_count == 3
+    assert schedule.initial_stage_count == 2
+
+    log = simulate_b2_prefill_issue_log(schedule)
+    assert log[0] == ("issue_stage", 1)
+    assert log[1] == ("issue_stage", 2)
+    assert log.index(("issue_stage", 2)) < log.index(("compute", 1))
+    assert log.index(("issue_stage", 3)) < log.index(("compute", 2))
+
+
+def test_plan_b2_prefill_async_schedule_disables_initial_prime_when_depth_zero():
+    waves = ((1,), (2,), (3,))
+    readiness = {1: True, 2: False, 3: False}
+
+    schedule = plan_b2_prefill_async_schedule(
+        waves,
+        slot_readiness=readiness,
+        prefetch_depth=0,
+        buffer_count=3,
+    )
+
+    assert schedule.initial_stage_count == 0
+    log = simulate_b2_prefill_issue_log(schedule)
+    assert log[:3] == (
+        ("issue_hit", 0),
+        ("compute", 0),
+        ("issue_stage", 1),
+    )
+
+
+def test_simulate_b2_prefill_issue_log_primes_stage_before_hit_compute():
+    waves = ((1,), (2,), (3,), (4,))
+    readiness = {1: True, 2: True, 3: False, 4: False}
+    schedule = plan_b2_prefill_async_schedule(waves, slot_readiness=readiness)
+
+    log = simulate_b2_prefill_issue_log(schedule, prefetch_depth=1, buffer_count=2)
+
+    assert log[:5] == (
+        ("issue_stage", 2),
+        ("issue_hit", 0),
+        ("compute", 0),
+        ("issue_hit", 1),
+        ("compute", 1),
+    )
+    assert log.index(("issue_stage", 3)) < log.index(("compute", 2))
+    assert log[-2:] == (
+        ("compute", 2),
+        ("compute", 3),
+    )
+
+
+def test_build_b2_pair_microbatch_keeps_only_wave_pairs_and_remaps_slots():
+    hidden_states = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    topk_ids = torch.tensor(
+        [
+            [1, 3],
+            [3, 4],
+            [1, 4],
+            [7, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.tensor(
+        [
+            [0.1, 0.3],
+            [0.4, 0.5],
+            [0.6, 0.7],
+            [0.8, 0.9],
+        ],
+        dtype=torch.float32,
+    )
+    log2phy = torch.full((8,), -1, dtype=torch.long)
+    log2phy[3] = 0
+    log2phy[4] = 2
+
+    mb = build_b2_pair_microbatch(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        log2phy,
+        wave_experts=(3, 4),
+    )
+
+    assert mb.num_pairs == 5
+    assert mb.restore_token_indices.tolist() == [0, 1, 1, 2, 3]
+    assert mb.logical_expert_ids.tolist() == [3, 3, 4, 4, 3]
+    assert mb.topk_ids.squeeze(1).tolist() == [0, 0, 2, 2, 0]
+    assert torch.allclose(
+        mb.topk_weights.squeeze(1),
+        torch.tensor([0.3, 0.4, 0.5, 0.7, 0.9]),
+    )
+    assert torch.equal(mb.hidden_states, hidden_states[mb.restore_token_indices])
+
+
+def test_build_b2_pair_microbatch_from_index_matches_scan_builder():
+    hidden_states = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    topk_ids = torch.tensor(
+        [
+            [1, 3],
+            [3, 4],
+            [1, 4],
+            [7, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.tensor(
+        [
+            [0.1, 0.3],
+            [0.4, 0.5],
+            [0.6, 0.7],
+            [0.8, 0.9],
+        ],
+        dtype=torch.float32,
+    )
+    log2phy = torch.full((8,), -1, dtype=torch.long)
+    log2phy[3] = 0
+    log2phy[4] = 2
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    scan = build_b2_pair_microbatch(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        log2phy,
+        wave_experts=(3, 4),
+    )
+    fast = build_b2_pair_microbatch_from_index(
+        hidden_states,
+        index,
+        log2phy,
+        wave_experts=(3, 4),
+    )
+
+    assert fast.num_pairs == scan.num_pairs
+    assert torch.equal(fast.hidden_states, scan.hidden_states)
+    assert torch.equal(fast.topk_ids, scan.topk_ids)
+    assert torch.equal(fast.topk_weights, scan.topk_weights)
+    assert torch.equal(fast.restore_token_indices, scan.restore_token_indices)
+    assert torch.equal(fast.logical_expert_ids, scan.logical_expert_ids)
+
+
+def test_build_b2_routed_pair_index_accepts_cached_pair_offsets():
+    hidden_states = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    topk_ids = torch.tensor(
+        [
+            [1, 3],
+            [3, 4],
+            [1, 4],
+            [7, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    log2phy = torch.full((8,), -1, dtype=torch.long)
+    log2phy[3] = 0
+    log2phy[4] = 2
+
+    index = build_b2_routed_pair_index(
+        topk_ids,
+        topk_weights,
+        pair_offsets_by_expert={
+            3: (1, 2, 7),
+            4: (3, 5),
+        },
+    )
+    mb = build_b2_pair_microbatch_from_index(
+        hidden_states,
+        index,
+        log2phy,
+        wave_experts=(3, 4),
+    )
+
+    assert mb.restore_token_indices.tolist() == [0, 1, 1, 2, 3]
+    assert mb.logical_expert_ids.tolist() == [3, 3, 4, 4, 3]
+    assert mb.topk_ids.squeeze(1).tolist() == [0, 0, 2, 2, 0]
+
+
+def test_build_b2_pair_microbatch_from_wave_plan_matches_index_builder():
+    hidden_states = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    topk_ids = torch.tensor(
+        [
+            [1, 3],
+            [3, 4],
+            [1, 4],
+            [7, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.tensor(
+        [
+            [0.1, 0.3],
+            [0.4, 0.5],
+            [0.6, 0.7],
+            [0.8, 0.9],
+        ],
+        dtype=torch.float32,
+    )
+    log2phy = torch.full((8,), -1, dtype=torch.long)
+    log2phy[3] = 0
+    log2phy[4] = 2
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+    plan = build_b2_wave_microbatch_plan(index, wave_experts=(3, 4))
+
+    from_index = build_b2_pair_microbatch_from_index(
+        hidden_states,
+        index,
+        log2phy,
+        wave_experts=(3, 4),
+    )
+    from_plan = build_b2_pair_microbatch_from_plan(
+        hidden_states,
+        topk_weights,
+        log2phy,
+        plan,
+    )
+
+    assert plan.num_pairs == 5
+    assert torch.equal(plan.token_indices, torch.tensor([0, 1, 1, 2, 3]))
+    assert torch.equal(plan.physical_slot_ids, torch.tensor([0, 0, 1, 1, 0]))
+    assert torch.equal(from_plan.hidden_states, from_index.hidden_states)
+    assert torch.equal(from_plan.topk_ids, from_index.topk_ids)
+    assert torch.equal(from_plan.topk_weights, from_index.topk_weights)
+    assert torch.equal(from_plan.restore_token_indices, from_index.restore_token_indices)
+    assert torch.equal(from_plan.logical_expert_ids, from_index.logical_expert_ids)
+
+
+def test_build_b2_pair_microbatch_from_wave_plan_can_skip_log2phy():
+    hidden_states = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    topk_ids = torch.tensor(
+        [
+            [1, 3],
+            [3, 4],
+            [1, 4],
+            [7, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.tensor(
+        [
+            [0.1, 0.3],
+            [0.4, 0.5],
+            [0.6, 0.7],
+            [0.8, 0.9],
+        ],
+        dtype=torch.float32,
+    )
+    log2phy = torch.full((8,), -1, dtype=torch.long)
+    log2phy[3] = 0
+    log2phy[4] = 1
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+    plan = build_b2_wave_microbatch_plan(index, wave_experts=(3, 4))
+
+    from_log2phy = build_b2_pair_microbatch_from_plan(
+        hidden_states,
+        topk_weights,
+        log2phy,
+        plan,
+    )
+    from_slots = build_b2_pair_microbatch_from_plan(
+        hidden_states,
+        topk_weights,
+        None,
+        plan,
+    )
+
+    assert torch.equal(from_slots.topk_ids, from_log2phy.topk_ids)
+    assert torch.equal(from_slots.topk_ids.squeeze(1), torch.tensor([0, 0, 1, 1, 0]))
+    assert torch.equal(from_slots.hidden_states, from_log2phy.hidden_states)
+    assert torch.equal(from_slots.topk_weights, from_log2phy.topk_weights)
+    assert torch.equal(from_slots.restore_token_indices, from_log2phy.restore_token_indices)
+    assert torch.equal(from_slots.logical_expert_ids, from_log2phy.logical_expert_ids)
+
+
+def test_build_b2_wave_microbatch_plan_can_use_main_slot_ids_for_hit_wave():
+    topk_ids = torch.tensor(
+        [
+            [1, 3],
+            [3, 4],
+            [1, 4],
+            [7, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    plan = build_b2_wave_microbatch_plan(
+        index,
+        wave_experts=(3, 4),
+        physical_slot_by_expert={3: 5, 4: 2},
+    )
+
+    assert plan.num_pairs == 5
+    assert torch.equal(plan.physical_slot_ids, torch.tensor([5, 5, 2, 2, 5]))
+
+
+def test_build_b2_wave_microbatch_plan_handles_empty_wave():
+    hidden_states = torch.randn(2, 4)
+    topk_ids = torch.tensor([[1, 2], [3, 1]], dtype=torch.long)
+    topk_weights = torch.ones(2, 2)
+    log2phy = torch.full((4,), -1, dtype=torch.long)
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+    plan = build_b2_wave_microbatch_plan(index, wave_experts=(0,))
+
+    mb = build_b2_pair_microbatch_from_plan(
+        hidden_states,
+        topk_weights,
+        log2phy,
+        plan,
+    )
+
+    assert plan.num_pairs == 0
+    assert mb.num_pairs == 0
+    assert mb.hidden_states.shape == (0, 4)
+
+
+def test_build_b2_wave_microbatch_plans_match_single_wave_builder():
+    topk_ids = torch.tensor(
+        [
+            [1, 3],
+            [3, 4],
+            [1, 4],
+            [7, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+    waves = ((3,), (0,), (4, 7), (1,))
+
+    batched = build_b2_wave_microbatch_plans(index, waves)
+
+    assert len(batched) == len(waves)
+    assert all(plan.layer_token_indices is batched[0].layer_token_indices for plan in batched)
+    assert all(plan.layer_topk_positions is batched[0].layer_topk_positions for plan in batched)
+    assert all(plan.layer_logical_expert_ids is batched[0].layer_logical_expert_ids for plan in batched)
+    assert all(plan.layer_physical_slot_ids is batched[0].layer_physical_slot_ids for plan in batched)
+    assert [plan.layer_pair_start for plan in batched] == [0, 3, 3, 6]
+    assert [plan.layer_pair_end for plan in batched] == [3, 3, 6, 8]
+    for wave, batch_plan in zip(waves, batched, strict=True):
+        single_plan = build_b2_wave_microbatch_plan(index, wave)
+        assert batch_plan.wave_experts == single_plan.wave_experts
+        assert torch.equal(batch_plan.pair_offsets, single_plan.pair_offsets)
+        assert torch.equal(batch_plan.token_indices, single_plan.token_indices)
+        assert torch.equal(batch_plan.topk_positions, single_plan.topk_positions)
+        assert torch.equal(batch_plan.logical_expert_ids, single_plan.logical_expert_ids)
+        assert torch.equal(batch_plan.physical_slot_ids, single_plan.physical_slot_ids)
+
+
+def test_materialize_b2_pair_microbatches_from_plans_matches_per_wave_builder():
+    hidden_states = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    topk_ids = torch.tensor(
+        [
+            [1, 3],
+            [3, 4],
+            [1, 4],
+            [7, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.tensor(
+        [
+            [0.1, 0.3],
+            [0.4, 0.5],
+            [0.6, 0.7],
+            [0.8, 0.9],
+        ],
+        dtype=torch.float32,
+    )
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+    plans = build_b2_wave_microbatch_plans(
+        index,
+        ((3,), (4, 7), (1,)),
+        physical_slot_by_expert={3: 5},
+    )
+
+    materialized = materialize_b2_pair_microbatches_from_plans(
+        hidden_states,
+        topk_weights,
+        plans,
+    )
+
+    assert len(materialized) == len(plans)
+    for plan, mb in zip(plans, materialized, strict=True):
+        expected = build_b2_pair_microbatch_from_plan(
+            hidden_states,
+            topk_weights,
+            None,
+            plan,
+        )
+        assert mb.num_pairs == expected.num_pairs
+        assert torch.equal(mb.hidden_states, expected.hidden_states)
+        assert torch.equal(mb.topk_ids, expected.topk_ids)
+        assert torch.equal(mb.topk_weights, expected.topk_weights)
+        assert torch.equal(mb.restore_token_indices, expected.restore_token_indices)
+        assert torch.equal(mb.logical_expert_ids, expected.logical_expert_ids)
+
+
+def test_build_b2_wave_microbatch_plans_all_empty_waves():
+    topk_ids = torch.tensor([[1, 2], [3, 1]], dtype=torch.long)
+    topk_weights = torch.ones(2, 2)
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    plans = build_b2_wave_microbatch_plans(index, ((0,), (4, 5)))
+
+    assert len(plans) == 2
+    assert all(plan.num_pairs == 0 for plan in plans)
+    assert plans[0].wave_experts == (0,)
+    assert plans[1].wave_experts == (4, 5)
+
+
+def test_scatter_add_b2_pair_output_accumulates_duplicate_tokens():
+    full = torch.zeros(4, 2)
+    pair_output = torch.tensor(
+        [
+            [1.0, 1.0],
+            [2.0, 2.0],
+            [3.0, 3.0],
+            [4.0, 4.0],
+        ]
+    )
+    restore = torch.tensor([0, 1, 1, 3], dtype=torch.long)
+
+    out = scatter_add_b2_pair_output(full, pair_output, restore)
+
+    assert out is full
+    assert torch.equal(
+        full,
+        torch.tensor(
+            [
+                [1.0, 1.0],
+                [5.0, 5.0],
+                [0.0, 0.0],
+                [4.0, 4.0],
+            ]
+        ),
+    )
+
+
+def test_scatter_add_b2_pair_outputs_matches_per_wave_scatter():
+    pair_outputs = (
+        torch.tensor([[1.0, 1.0], [2.0, 2.0]]),
+        torch.tensor([[3.0, 3.0], [4.0, 4.0], [5.0, 5.0]]),
+        torch.empty(0, 2),
+    )
+    restore_indices = (
+        torch.tensor([0, 1], dtype=torch.long),
+        torch.tensor([1, 3, 0], dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+    )
+    sequential = torch.zeros(4, 2)
+    batched = torch.zeros(4, 2)
+
+    for output, indices in zip(pair_outputs, restore_indices, strict=True):
+        scatter_add_b2_pair_output(sequential, output, indices)
+    scatter_add_b2_pair_outputs(batched, pair_outputs, restore_indices)
+
+    assert torch.equal(batched, sequential)
+    assert torch.equal(
+        batched,
+        torch.tensor(
+            [
+                [6.0, 6.0],
+                [5.0, 5.0],
+                [0.0, 0.0],
+                [4.0, 4.0],
+            ]
+        ),
+    )
+
+
+def test_direct_scatter_add_b2_permuted_output_matches_combine_then_scatter():
+    full_old = torch.zeros(4, 2)
+    full_direct = torch.zeros(4, 2)
+    permuted = torch.tensor(
+        [
+            [4.0, 40.0],
+            [1.0, 10.0],
+            [5.0, 50.0],
+            [2.0, 20.0],
+            [3.0, 30.0],
+        ]
+    )
+    # AllGather token_combine uses abs(expanded_row_idx) as an unpermute index:
+    # microbatch row i gathers permuted row abs(expanded_row_idx)[i].
+    expanded = torch.tensor([3, 0, 4, 1, 2], dtype=torch.int32)
+    weights = torch.tensor([[0.1], [0.2], [0.3], [0.4], [0.5]])
+    restore = torch.tensor([0, 1, 1, 3, 0], dtype=torch.long)
+
+    expanded_abs = expanded.abs().to(torch.long)
+    wave_local = permuted.index_select(0, expanded_abs) * weights
+    scatter_add_b2_pair_output(full_old, wave_local, restore)
+
+    direct_scatter_add_b2_permuted_output(
+        full_direct,
+        permuted_tokens=permuted,
+        expanded_row_idx=expanded,
+        topk_weights=weights,
+        restore_token_indices=restore,
+    )
+
+    assert torch.allclose(full_direct, full_old)
+
+
+def test_direct_scatter_add_b2_permuted_outputs_batches_waves():
+    payloads = (
+        B2DirectScatterPayload(
+            permuted_tokens=torch.tensor([[3.0, 30.0], [1.0, 10.0], [5.0, 50.0]]),
+            expanded_row_idx=torch.tensor([2, 0, 1], dtype=torch.int32),
+            topk_weights=torch.tensor([[0.5], [0.7], [0.9]]),
+            restore_token_indices=torch.tensor([0, 1, 0], dtype=torch.long),
+        ),
+        B2DirectScatterPayload(
+            permuted_tokens=torch.tensor([[4.0, 40.0], [2.0, 20.0]]),
+            expanded_row_idx=torch.tensor([1, 0], dtype=torch.int32),
+            topk_weights=torch.tensor([[0.25], [0.75]]),
+            restore_token_indices=torch.tensor([2, 1], dtype=torch.long),
+        ),
+    )
+    sequential = torch.zeros(3, 2)
+    batched = torch.zeros(3, 2)
+
+    for payload in payloads:
+        direct_scatter_add_b2_permuted_output(
+            sequential,
+            permuted_tokens=payload.permuted_tokens,
+            expanded_row_idx=payload.expanded_row_idx,
+            topk_weights=payload.topk_weights,
+            restore_token_indices=payload.restore_token_indices,
+        )
+    direct_scatter_add_b2_permuted_outputs(batched, payloads)
+
+    assert torch.allclose(batched, sequential)
+    assert torch.allclose(
+        batched,
+        torch.tensor(
+            [
+                [3.4, 34.0],
+                [5.1, 51.0],
+                [0.5, 5.0],
+            ]
+        ),
+    )
+
+
+def test_direct_scatter_add_b2_permuted_outputs_offsets_wave_local_indices():
+    payloads = (
+        B2DirectScatterPayload(
+            permuted_tokens=torch.tensor([[1.0], [2.0]]),
+            expanded_row_idx=torch.tensor([1, 0], dtype=torch.int32),
+            topk_weights=torch.tensor([[10.0], [20.0]]),
+            restore_token_indices=torch.tensor([0, 1], dtype=torch.long),
+        ),
+        B2DirectScatterPayload(
+            permuted_tokens=torch.tensor([[100.0], [200.0]]),
+            expanded_row_idx=torch.tensor([1, 0], dtype=torch.int32),
+            topk_weights=torch.tensor([[0.1], [0.2]]),
+            restore_token_indices=torch.tensor([0, 1], dtype=torch.long),
+        ),
+    )
+
+    full = torch.zeros(2, 1)
+    direct_scatter_add_b2_permuted_outputs(full, payloads)
+
+    assert torch.allclose(full, torch.tensor([[40.0], [40.0]]))
+
+
+def test_build_b2_pair_microbatch_can_skip_hot_path_unstaged_validation():
+    hidden_states = torch.randn(2, 4)
+    topk_ids = torch.tensor([[1, 2], [3, 1]], dtype=torch.long)
+    topk_weights = torch.ones(2, 2)
+    log2phy = torch.full((4,), -1, dtype=torch.long)
+    log2phy[2] = 0
+
+    mb = build_b2_pair_microbatch(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        log2phy,
+        wave_experts=(1, 2),
+    )
+
+    assert mb.num_pairs == 3
+    assert (mb.topk_ids < 0).any()
+
+
+def test_build_b2_pair_microbatch_rejects_unstaged_wave_expert_when_validating(monkeypatch):
+    monkeypatch.setenv("SEW_B2_VALIDATE", "1")
+    hidden_states = torch.randn(2, 4)
+    topk_ids = torch.tensor([[1, 2], [3, 1]], dtype=torch.long)
+    topk_weights = torch.ones(2, 2)
+    log2phy = torch.full((4,), -1, dtype=torch.long)
+    log2phy[2] = 0
+
+    with pytest.raises(RuntimeError, match="unstaged experts"):
+        build_b2_pair_microbatch(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            log2phy,
+            wave_experts=(1, 2),
+        )

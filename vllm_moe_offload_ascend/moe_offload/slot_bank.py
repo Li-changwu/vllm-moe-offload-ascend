@@ -85,7 +85,7 @@ class ExpertSlotBank:
         if slot is None:
             slot = self._lru_evictable_slot()
         if slot is None:
-            raise RuntimeError("no evictable expert slots")
+            raise RuntimeError(f"no evictable expert slots; states={self.state_counts()}")
 
         if slot.expert_key is not None:
             self._resident.pop(slot.expert_key, None)
@@ -109,9 +109,61 @@ class ExpertSlotBank:
         slot_id = self._resident.get(expert_key)
         return None if slot_id is None else self.slots[slot_id]
 
+    def assign_slot(self, slot_id: int, expert_key: ExpertKey, *, step_id: int) -> ExpertSlot:
+        slot = self.slots[int(slot_id)]
+        if slot.expert_key is not None and slot.expert_key != expert_key:
+            self._resident.pop(slot.expert_key, None)
+        existing_slot_id = self._resident.get(expert_key)
+        if existing_slot_id is not None and existing_slot_id != int(slot_id):
+            old_slot = self.slots[int(existing_slot_id)]
+            old_slot.expert_key = None
+            old_slot.state = SlotState.EMPTY
+        slot.expert_key = expert_key
+        slot.version += 1
+        slot.last_used_step = int(step_id)
+        slot.state = SlotState.LOADING
+        self._resident[expert_key] = int(slot_id)
+        return slot
+
+    def assign_transient_slot(
+        self,
+        slot_id: int,
+        expert_key: ExpertKey,
+        *,
+        step_id: int,
+    ) -> ExpertSlot:
+        """Assign a temporary wave slot without updating the lookup index.
+
+        Prefill staging banks are short-lived double buffers. The B2 dataplane
+        already receives an explicit logical->physical mapping, so maintaining
+        the resident lookup dictionary for every staged wave is pure control
+        overhead.
+        """
+        slot = self.slots[int(slot_id)]
+        if slot.expert_key is not None:
+            self._resident.pop(slot.expert_key, None)
+        slot.expert_key = expert_key
+        slot.version += 1
+        slot.last_used_step = int(step_id)
+        slot.state = SlotState.LOADING
+        return slot
+
+    def clear_slot(self, slot_id: int) -> None:
+        slot = self.slots[int(slot_id)]
+        if slot.expert_key is not None:
+            self._resident.pop(slot.expert_key, None)
+        slot.expert_key = None
+        slot.state = SlotState.EMPTY
+
     @property
     def total_bytes(self) -> int:
         return _tensor_nbytes(self.w13_slots) + _tensor_nbytes(self.w2_slots)
+
+    def state_counts(self) -> dict[str, int]:
+        counts = {state.value: 0 for state in SlotState}
+        for slot in self.slots:
+            counts[str(slot.state.value)] = counts.get(str(slot.state.value), 0) + 1
+        return counts
 
     def _first_empty_slot(self) -> ExpertSlot | None:
         for slot in self.slots:

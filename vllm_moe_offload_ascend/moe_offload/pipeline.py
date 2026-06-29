@@ -172,7 +172,7 @@ class MoePipelineProfiler:
 
     @property
     def enabled(self) -> bool:
-        return envs.VLLM_ASCEND_MOE_PIPELINE_PROFILING
+        return bool(getattr(envs, "VLLM_ASCEND_MOE_PIPELINE_PROFILING", False))
 
     def record(self) -> "torch.npu.Event":
         import torch
