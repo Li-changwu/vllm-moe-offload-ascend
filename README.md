@@ -92,7 +92,7 @@ vllm serve <model> --trust-remote-code ...
 
 不要和 vLLM 原生 weight offload 参数混用，例如 `--offload-backend prefetch`、`--offload-group-size`、`--cpu-offload-gb`。本插件通过 vllm-ascend-hust 的 MoE hooks 管理 expert offload，原生 offloader 是另一套路径。
 
-如果设置 `VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE=1`，表示启用 graph-compatible 的 SEW fixed-slot 数据通路；这条路径会主动拒绝原生 prefetch offload 参数。未启用 SEW 数据通路时，AutoConfig 的普通分层路径仍可能通过 vLLM PrefetchOffloader 保留 high-fanout full-weight fallback，这是 legacy/layered 路径的一部分，不应和 SEW fixed-slot 实验混为同一组对比。
+如果设置 `VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE=1`，表示启用 graph-compatible 的 SEW fixed-slot 数据通路；这条路径会主动拒绝原生 prefetch offload 参数，并默认打开 B2 Prefill async load、pinned host store 和 transfer-aware wave schedule。未启用 SEW 数据通路时，AutoConfig 的普通分层路径仍可能通过 vLLM PrefetchOffloader 保留 high-fanout full-weight fallback，这是 legacy/layered 路径的一部分，不应和 SEW fixed-slot 实验混为同一组对比。
 
 ### CPU-first expert loading（实验）
 
@@ -132,6 +132,7 @@ pip uninstall vllm-moe-offload-ascend
 | `VLLM_ASCEND_MOE_OFFLOAD_POLICY` | `deadline` | 调度策略（`deadline` / `lru`） |
 | `VLLM_ASCEND_MOE_OFFLOAD_TRACE_ONLY` | `0` | 仅收集 routing trace，不做实际 offload |
 | `VLLM_ASCEND_MOE_OFFLOAD_LAYERED_RUNTIME` | 普通路径 `1`，SEW 路径 `0` | 启用分层运行时（resident + offload 混合） |
+| `VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD` | 普通路径 `0`，SEW 路径 `1` | 使用独立 transfer stream 异步加载 expert；Prefill B2 overlap 依赖该开关 |
 | `VLLM_ASCEND_MOE_OFFLOAD_FANOUT_THRESHOLD` | 跟随 `NUM_SLOTS` | 切换 slot cache / full weight 路径的 expert 数阈值 |
 | `VLLM_ASCEND_MOE_OFFLOAD_MAX_PHASES` | `1` | Phase split 最大阶段数 |
 | `VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS` | `0` | host store 注册后是否释放 offloaded layer 的原始 NPU expert 权重 |
@@ -141,6 +142,7 @@ pip uninstall vllm-moe-offload-ascend
 | `VLLM_ASCEND_MOE_OFFLOAD_MIN_NET_SAVING_GB` | 未设置 | 自动推导 slots 时至少保留的净显存收益 GiB 下限 |
 | `VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE` | `0` | 启用 SEW router-stage-MLP graph-compatible fixed-slot 数据通路 |
 | `VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD` | `0` | 实验开关；offloaded unquantized MoE expert 在初始化时直接落到 CPU host store，降低启动期 NPU 峰值 |
+| `VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE` | SEW 路径 `1` | Prefill B2 根据每个 wave 的 H2D bytes 和 routed pair 数调整 stage/compute 顺序，尽量用当前 wave 计算覆盖下一波加载 |
 | `VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH` | `1` | SEW B2 Prefill 软件流水预取深度 |
 | `VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT` | `2` | SEW B2 Prefill stage buffer 数 |
 | `VLLM_ASCEND_MOE_GMM_PROFILE_PATH` | 未设置 | MoE/GMM profile JSONL 输出路径 |

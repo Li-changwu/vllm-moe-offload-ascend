@@ -65,6 +65,7 @@ class MoeOffloadConfig:
     # B2 Prefill software pipeline knobs. Depth=1 with two buffers is the current
     # double-buffer behavior; larger values are useful for measuring H2D/MLP
     # overlap on workloads with short per-wave compute.
+    transfer_aware_wave_schedule: bool = True
     prefill_prefetch_depth: int = 1
     prefill_buffer_count: int = 2
     # P1-C scaffold: optional profiling-suite plan for stable grouped compute buckets.
@@ -103,6 +104,7 @@ class MoeOffloadConfig:
             b2_wave_prefill=envs.VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL,
             cpu_first_load=envs.VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD,
             pin_host_memory=envs.VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY,
+            transfer_aware_wave_schedule=envs.VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE,
             prefill_prefetch_depth=envs.VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH,
             prefill_buffer_count=envs.VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT,
             compute_bucket_plan_path=envs.VLLM_ASCEND_MOE_COMPUTE_BUCKET_PLAN_PATH,

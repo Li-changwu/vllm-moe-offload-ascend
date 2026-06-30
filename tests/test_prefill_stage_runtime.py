@@ -184,7 +184,7 @@ def test_register_layer_pins_host_store_when_enabled(monkeypatch):
     report = event["payload"]["host_store"]
     assert report["pin_memory_requested"] is True
     assert report["pin_memory_enabled"] is True
-    assert report["pinned_tensors"] == 8
+    assert report["pinned_tensors"] == 2
     assert report["pin_failures"] == []
 
 
@@ -209,7 +209,7 @@ def test_register_layer_reports_pin_memory_failure_without_blocking(monkeypatch)
     assert report["pin_memory_requested"] is True
     assert report["pin_memory_enabled"] is False
     assert report["pinned_tensors"] == 0
-    assert len(report["pin_failures"]) == 8
+    assert len(report["pin_failures"]) == 2
 
 
 def test_prepare_ready_slot_plan_reuses_main_slot_bank_without_transfer(monkeypatch):
@@ -350,13 +350,15 @@ def test_prepare_fixed_slot_plan_records_decode_hit_miss_profile(monkeypatch):
         device=torch.device("cpu"),
     )
     load_calls = []
-    original_load_sync = runtime._transfer_engine.load_sync
+    original_load_many_sync = runtime._transfer_engine.load_many_sync
 
-    def counted_load_sync(bundle, slot):
-        load_calls.append((int(bundle.expert_id), int(slot.slot_id)))
-        original_load_sync(bundle, slot)
+    def counted_load_many_sync(loads, **kwargs):
+        load_calls.extend(
+            (int(bundle.expert_id), int(slot.slot_id)) for bundle, slot in loads
+        )
+        original_load_many_sync(loads, **kwargs)
 
-    monkeypatch.setattr(runtime._transfer_engine, "load_sync", counted_load_sync)
+    monkeypatch.setattr(runtime._transfer_engine, "load_many_sync", counted_load_many_sync)
 
     runtime.prepare_fixed_slot_plan(
         layer_id=7,

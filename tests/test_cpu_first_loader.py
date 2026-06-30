@@ -11,6 +11,11 @@ from vllm_moe_offload_ascend.moe_offload.cpu_first_loader import (
 )
 from vllm_moe_offload_ascend.moe_offload.host_store import HostExpertStore
 from vllm_moe_offload_ascend.moe_offload.runtime import MoeOffloadRuntime
+from vllm_moe_offload_ascend.moe_offload.slot_bank import ExpertSlotBank, SlotState
+from vllm_moe_offload_ascend.moe_offload.transfer_engine import (
+    TransferEngine,
+    _try_batch_view,
+)
 
 
 class FakeMethod:
@@ -146,3 +151,76 @@ def test_host_store_clone_tensors_false_adopts_cpu_parameter_views():
     bundle = store.get(7, 2)
     assert bundle.w13.data_ptr() == layer.w13_weight[2].data_ptr()
     assert bundle.w2.data_ptr() == layer.w2_weight[2].data_ptr()
+
+
+def test_host_store_bundles_are_views_of_contiguous_layer_buffers():
+    layer = TinyLayer()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.arange(4 * 3 * 2, dtype=torch.float32).reshape(4, 3, 2),
+        requires_grad=False,
+    )
+    store = HostExpertStore()
+
+    store.register_layer(layer, clone_tensors=True)
+
+    layer_buffer = store._layer_buffers[7]
+    bundle = store.get(7, 3)
+    assert layer_buffer.w13.is_contiguous()
+    assert layer_buffer.w2.is_contiguous()
+    assert bundle.w13.data_ptr() == layer_buffer.w13[3].data_ptr()
+    assert bundle.w2.data_ptr() == layer_buffer.w2[3].data_ptr()
+
+
+def test_transfer_engine_builds_batch_view_for_contiguous_host_experts():
+    layer = TinyLayer()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.arange(4 * 3 * 2, dtype=torch.float32).reshape(4, 3, 2),
+        requires_grad=False,
+    )
+    store = HostExpertStore()
+    store.register_layer(layer, clone_tensors=True)
+
+    contiguous = tuple(store.get(7, expert_id).w13 for expert_id in (0, 1, 2))
+    non_contiguous = tuple(store.get(7, expert_id).w13 for expert_id in (0, 2))
+
+    batch = _try_batch_view(contiguous)
+    assert batch is not None
+    assert tuple(batch.shape) == (3, 2, 3)
+    assert torch.equal(batch[2], store.get(7, 2).w13)
+    assert _try_batch_view(non_contiguous) is None
+
+
+def test_transfer_engine_load_many_sync_copies_contiguous_run():
+    layer = TinyLayer()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.arange(4 * 3 * 2, dtype=torch.float32).reshape(4, 3, 2),
+        requires_grad=False,
+    )
+    store = HostExpertStore()
+    store.register_layer(layer, clone_tensors=True)
+    bank = ExpertSlotBank(
+        4,
+        tuple(layer.w13_weight.shape[1:]),
+        tuple(layer.w2_weight.shape[1:]),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    loads = [(store.get(7, expert_id), bank.slots[expert_id]) for expert_id in (0, 1, 2)]
+
+    TransferEngine().load_many_sync(loads)
+
+    assert torch.equal(bank.w13_slots[:3], layer.w13_weight[:3])
+    assert torch.equal(bank.w2_slots[:3], layer.w2_weight[:3])
+    assert all(bank.slots[slot_id].state == SlotState.READY for slot_id in (0, 1, 2))

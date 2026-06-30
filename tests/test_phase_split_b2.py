@@ -146,6 +146,47 @@ def test_plan_b2_prefill_async_schedule_disables_initial_prime_when_depth_zero()
     )
 
 
+def test_plan_b2_prefill_async_schedule_uses_transfer_estimates_when_enabled():
+    waves = ((1,), (2,), (3,), (4,))
+    readiness = {1: True, 2: True, 3: False, 4: False}
+
+    schedule = plan_b2_prefill_async_schedule(
+        waves,
+        slot_readiness=readiness,
+        h2d_bytes_by_wave={2: 100, 3: 1000},
+        compute_cost_by_wave={0: 1.0, 1: 10.0, 2: 5.0, 3: 4.0},
+        transfer_aware=True,
+    )
+
+    assert schedule.transfer_aware is True
+    assert schedule.compute_order == (1, 0, 3, 2)
+    assert schedule.staged_issue_order == (3, 2)
+    assert schedule.to_jsonable()["estimated_h2d_bytes_by_wave"] == [0, 0, 100, 1000]
+
+    log = simulate_b2_prefill_issue_log(schedule, prefetch_depth=1, buffer_count=2)
+    assert log[0] == ("issue_stage", 3)
+    assert log.index(("issue_stage", 3)) < log.index(("compute", 1))
+    assert log.index(("issue_stage", 2)) < log.index(("compute", 3))
+
+
+def test_plan_b2_prefill_async_schedule_keeps_order_when_prefetch_disabled():
+    waves = ((1,), (2,), (3,))
+    readiness = {1: True, 2: False, 3: False}
+
+    schedule = plan_b2_prefill_async_schedule(
+        waves,
+        slot_readiness=readiness,
+        prefetch_depth=0,
+        h2d_bytes_by_wave={2: 1000, 1: 1},
+        compute_cost_by_wave={0: 100.0, 1: 1.0, 2: 1.0},
+        transfer_aware=True,
+    )
+
+    assert schedule.transfer_aware is False
+    assert schedule.compute_order == (0, 1, 2)
+    assert schedule.staged_issue_order == (1, 2)
+
+
 def test_simulate_b2_prefill_issue_log_primes_stage_before_hit_compute():
     waves = ((1,), (2,), (3,), (4,))
     readiness = {1: True, 2: True, 3: False, 4: False}

@@ -822,6 +822,7 @@ class MoeOffloadRuntime:
         miss_experts: list[int] = []
         h2d_bytes = 0
         load_sync_ms = 0.0
+        sync_loads = []
         _n_hits = 0
         _n_misses = 0
         stage_start = perf_counter() if collect_profile else 0.0
@@ -857,8 +858,14 @@ class MoeOffloadRuntime:
                     layer_id=layer_id,
                     expert_id=int(expert_id),
                 )
-                load_start = perf_counter()
-            self._transfer_engine.load_sync(bundle, slot)
+            sync_loads.append((bundle, slot))
+
+        if sync_loads:
+            load_start = perf_counter() if collect_profile else 0.0
+            self._transfer_engine.load_many_sync(
+                sync_loads,
+                validate_layout=True,
+            )
             if collect_profile:
                 load_sync_ms += (perf_counter() - load_start) * 1000.0
 
@@ -964,6 +971,7 @@ class MoeOffloadRuntime:
         ready_wait_ms = 0.0
         ready_event = None
         async_loads = []
+        sync_loads = []
         _n_hits = 0
         _n_misses = 0
         stage_start = perf_counter() if collect_profile else 0.0
@@ -1004,12 +1012,17 @@ class MoeOffloadRuntime:
                 if self.config.async_load:
                     async_loads.append((bundle, slot))
                 else:
-                    if collect_profile:
-                        load_start = perf_counter()
-                    self._transfer_engine.load_sync(bundle, slot)
-                    if collect_profile:
-                        load_sync_ms += (perf_counter() - load_start) * 1000.0
+                    sync_loads.append((bundle, slot))
             active_slot_ids.append(int(slot.slot_id))
+
+        if sync_loads:
+            load_start = perf_counter() if collect_profile else 0.0
+            self._transfer_engine.load_many_sync(
+                sync_loads,
+                validate_layout=True,
+            )
+            if collect_profile:
+                load_sync_ms += (perf_counter() - load_start) * 1000.0
 
         if async_loads:
             load_start = perf_counter() if collect_profile else 0.0
@@ -1232,6 +1245,7 @@ class MoeOffloadRuntime:
         miss_experts: list[int] = []
         active_slot_ids: list[int] = []
         async_loads = []
+        sync_loads = []
         queued_async_load = False
         collect_profile = bool(
             self.config.gmm_profile_path
@@ -1286,9 +1300,15 @@ class MoeOffloadRuntime:
                 async_loads.append((bundle, stage_slot))
                 queued_async_load = True
             else:
-                timer = perf_counter() if collect_profile else 0.0
-                self._transfer_engine.load_sync(bundle, stage_slot)
-                _mark("load_enqueue", timer)
+                sync_loads.append((bundle, stage_slot))
+
+        if not async_load and sync_loads:
+            timer = perf_counter() if collect_profile else 0.0
+            self._transfer_engine.load_many_sync(
+                sync_loads,
+                validate_layout=False,
+            )
+            _mark("load_enqueue", timer)
 
         ready_event = None
         if async_load and async_loads:

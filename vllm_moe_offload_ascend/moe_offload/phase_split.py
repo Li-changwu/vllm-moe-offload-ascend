@@ -149,10 +149,11 @@ class B2WavePlan:
 class B2PrefillAsyncSchedule:
     """Compute order plus early staging order for B2 prefill waves.
 
-    Compute order stays equal to the planner's wave order, preserving the
-    deterministic scatter-add path. Staging order contains only waves with at
-    least one miss, so their H2D can be issued before hit-only waves are
-    computed.
+    Without transfer-aware estimates, compute order stays equal to the planner's
+    wave order. With estimates, hit waves are allowed to run first as compute
+    cover while staged waves are issued in long-transfer-first order. Staging
+    order contains only waves with at least one miss, so their H2D can be issued
+    before hit-only waves are computed.
     """
 
     compute_order: tuple[int, ...]
@@ -162,6 +163,9 @@ class B2PrefillAsyncSchedule:
     prefetch_depth: int = 1
     buffer_count: int = 2
     initial_stage_count: int = 0
+    transfer_aware: bool = False
+    estimated_h2d_bytes_by_wave: tuple[int, ...] = ()
+    estimated_compute_cost_by_wave: tuple[float, ...] = ()
 
     def to_jsonable(self) -> dict[str, object]:
         return {
@@ -172,6 +176,13 @@ class B2PrefillAsyncSchedule:
             "prefetch_depth": int(self.prefetch_depth),
             "buffer_count": int(self.buffer_count),
             "initial_stage_count": int(self.initial_stage_count),
+            "transfer_aware": bool(self.transfer_aware),
+            "estimated_h2d_bytes_by_wave": [
+                int(v) for v in self.estimated_h2d_bytes_by_wave
+            ],
+            "estimated_compute_cost_by_wave": [
+                float(v) for v in self.estimated_compute_cost_by_wave
+            ],
         }
 
 
@@ -507,12 +518,17 @@ def plan_b2_prefill_async_schedule(
     slot_readiness: dict[int, bool] | None = None,
     prefetch_depth: int = 1,
     buffer_count: int = 2,
+    h2d_bytes_by_wave: dict[int, int] | tuple[int, ...] | None = None,
+    compute_cost_by_wave: dict[int, float] | tuple[float, ...] | None = None,
+    transfer_aware: bool = False,
 ) -> B2PrefillAsyncSchedule:
     """Plan staging order without changing B2 wave compute order.
 
     Hit-only waves use the main slot cache and do not consume temp stage buffers.
     Waves with any miss need temp staging, so they are listed in
-    ``staged_issue_order`` and can be primed before hit-only compute starts.
+    ``staged_issue_order`` and can be primed before hit-only compute starts. When
+    ``transfer_aware`` is enabled, long H2D waves are staged first and high-cost
+    hit waves are computed first to provide cover for those transfers.
     """
     readiness = slot_readiness or {}
     hit_wave_indices: list[int] = []
@@ -529,15 +545,94 @@ def plan_b2_prefill_async_schedule(
         effective_buffer_count,
         len(staged_wave_indices),
     )
+    h2d_estimates = _normalize_wave_int_estimates(
+        h2d_bytes_by_wave,
+        wave_count=len(waves),
+    )
+    compute_estimates = _normalize_wave_float_estimates(
+        compute_cost_by_wave,
+        wave_count=len(waves),
+    )
+    use_transfer_aware = (
+        bool(transfer_aware)
+        and bool(waves)
+        and effective_prefetch_depth > 0
+        and effective_buffer_count > 1
+    )
+    if use_transfer_aware:
+        hit_compute_order = tuple(
+            sorted(
+                hit_wave_indices,
+                key=lambda wave_idx: (
+                    -float(compute_estimates[int(wave_idx)]),
+                    int(wave_idx),
+                ),
+            )
+        )
+        staged_issue_order = tuple(
+            sorted(
+                staged_wave_indices,
+                key=lambda wave_idx: (
+                    -int(h2d_estimates[int(wave_idx)]),
+                    -float(compute_estimates[int(wave_idx)]),
+                    int(wave_idx),
+                ),
+            )
+        )
+        compute_order = hit_compute_order + staged_issue_order
+    else:
+        staged_issue_order = tuple(staged_wave_indices)
+        compute_order = tuple(range(len(waves)))
 
     return B2PrefillAsyncSchedule(
-        compute_order=tuple(range(len(waves))),
+        compute_order=compute_order,
         hit_wave_indices=tuple(hit_wave_indices),
         staged_wave_indices=tuple(staged_wave_indices),
-        staged_issue_order=tuple(staged_wave_indices),
+        staged_issue_order=staged_issue_order,
         prefetch_depth=effective_prefetch_depth,
         buffer_count=effective_buffer_count,
         initial_stage_count=initial_stage_count,
+        transfer_aware=use_transfer_aware,
+        estimated_h2d_bytes_by_wave=h2d_estimates,
+        estimated_compute_cost_by_wave=compute_estimates,
+    )
+
+
+def _normalize_wave_int_estimates(
+    estimates: dict[int, int] | tuple[int, ...] | None,
+    *,
+    wave_count: int,
+) -> tuple[int, ...]:
+    if estimates is None:
+        return tuple(0 for _ in range(int(wave_count)))
+    if isinstance(estimates, dict):
+        return tuple(
+            max(0, int(estimates.get(int(wave_idx), 0)))
+            for wave_idx in range(int(wave_count))
+        )
+    values = tuple(int(v) for v in estimates)
+    return tuple(
+        max(0, int(values[wave_idx])) if wave_idx < len(values) else 0
+        for wave_idx in range(int(wave_count))
+    )
+
+
+def _normalize_wave_float_estimates(
+    estimates: dict[int, float] | tuple[float, ...] | None,
+    *,
+    wave_count: int,
+) -> tuple[float, ...]:
+    if estimates is None:
+        return tuple(0.0 for _ in range(int(wave_count)))
+    if isinstance(estimates, dict):
+        return tuple(
+            max(0.0, float(estimates.get(int(wave_idx), 0.0)))
+            for wave_idx in range(int(wave_count))
+        )
+    values = tuple(float(v) for v in estimates)
+    return tuple(
+        max(0.0, float(values[wave_idx])) if wave_idx < len(values) else 0.0
+        for wave_idx in range(int(wave_count))
     )
 
 

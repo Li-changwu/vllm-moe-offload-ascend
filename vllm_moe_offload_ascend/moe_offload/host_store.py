@@ -37,6 +37,30 @@ class ExpertWeightBundle:
 
 
 @dataclass(frozen=True)
+class HostExpertLayerBuffer:
+    layer_id: int
+    w13: torch.Tensor
+    w2: torch.Tensor
+
+    @property
+    def num_experts(self) -> int:
+        return int(self.w13.shape[0])
+
+    @property
+    def total_bytes(self) -> int:
+        return _tensor_nbytes(self.w13) + _tensor_nbytes(self.w2)
+
+    def bundle(self, expert_id: int) -> ExpertWeightBundle:
+        normalized_expert_id = int(expert_id)
+        return ExpertWeightBundle(
+            layer_id=int(self.layer_id),
+            expert_id=normalized_expert_id,
+            w13=self.w13[normalized_expert_id],
+            w2=self.w2[normalized_expert_id],
+        )
+
+
+@dataclass(frozen=True)
 class HostExpertLayerSignature:
     layer_id: int
     num_experts: int
@@ -82,6 +106,7 @@ class HostExpertStore:
     def __init__(self) -> None:
         self._weights: dict[ExpertKey, ExpertWeightBundle] = {}
         self._weights_by_layer: dict[int, tuple[ExpertWeightBundle, ...]] = {}
+        self._layer_buffers: dict[int, HostExpertLayerBuffer] = {}
         self._layer_signatures: dict[int, HostExpertLayerSignature] = {}
 
     def register_layer(
@@ -102,36 +127,42 @@ class HostExpertStore:
             raise ValueError("host expert store requires at least one expert")
         self._weights = {key: bundle for key, bundle in self._weights.items() if key.layer_id != layer_id}
         self._weights_by_layer.pop(layer_id, None)
+        self._layer_buffers.pop(layer_id, None)
+        w13_host, w13_pinned, w13_error = _to_host_layer_tensor(
+            w13_weight,
+            clone=clone_tensors,
+            pin_memory=pin_memory,
+        )
+        w2_host, w2_pinned, w2_error = _to_host_layer_tensor(
+            w2_weight,
+            clone=clone_tensors,
+            pin_memory=pin_memory,
+        )
+        layer_buffer = HostExpertLayerBuffer(
+            layer_id=layer_id,
+            w13=w13_host,
+            w2=w2_host,
+        )
+        self._layer_buffers[layer_id] = layer_buffer
         self._layer_signatures[layer_id] = HostExpertLayerSignature(
             layer_id=layer_id,
             num_experts=num_experts,
-            w13_shape=tuple(int(dim) for dim in w13_weight.shape[1:]),
-            w13_dtype=w13_weight.dtype,
-            w13_stride=_expert_stride(w13_weight),
-            w2_shape=tuple(int(dim) for dim in w2_weight.shape[1:]),
-            w2_dtype=w2_weight.dtype,
-            w2_stride=_expert_stride(w2_weight),
+            w13_shape=tuple(int(dim) for dim in w13_host.shape[1:]),
+            w13_dtype=w13_host.dtype,
+            w13_stride=_expert_stride(w13_host),
+            w2_shape=tuple(int(dim) for dim in w2_host.shape[1:]),
+            w2_dtype=w2_host.dtype,
+            w2_stride=_expert_stride(w2_host),
         )
-        pinned_tensors = 0
+        pinned_tensors = int(w13_pinned) + int(w2_pinned)
         pin_failures: list[str] = []
+        if w13_error is not None:
+            pin_failures.append(f"w13_layer:{w13_error}")
+        if w2_error is not None:
+            pin_failures.append(f"w2_layer:{w2_error}")
         layer_bundles: list[ExpertWeightBundle] = []
         for expert_id in range(num_experts):
-            w13 = _to_host_tensor(w13_weight[expert_id], clone=clone_tensors)
-            w2 = _to_host_tensor(w2_weight[expert_id], clone=clone_tensors)
-            if pin_memory:
-                w13, w13_pinned, w13_error = _maybe_pin_tensor(w13)
-                w2, w2_pinned, w2_error = _maybe_pin_tensor(w2)
-                pinned_tensors += int(w13_pinned) + int(w2_pinned)
-                if w13_error is not None:
-                    pin_failures.append(f"expert={expert_id},w13:{w13_error}")
-                if w2_error is not None:
-                    pin_failures.append(f"expert={expert_id},w2:{w2_error}")
-            bundle = ExpertWeightBundle(
-                layer_id=layer_id,
-                expert_id=expert_id,
-                w13=w13,
-                w2=w2,
-            )
+            bundle = layer_buffer.bundle(expert_id)
             self._weights[bundle.key] = bundle
             layer_bundles.append(bundle)
         self._weights_by_layer[layer_id] = tuple(layer_bundles)
@@ -188,13 +219,8 @@ class HostExpertStore:
     @property
     def total_bytes(self) -> int:
         total = 0
-        for bundle in self._weights.values():
-            total += _tensor_nbytes(bundle.w13)
-            total += _tensor_nbytes(bundle.w2)
-            if bundle.w13_scale is not None:
-                total += _tensor_nbytes(bundle.w13_scale)
-            if bundle.w2_scale is not None:
-                total += _tensor_nbytes(bundle.w2_scale)
+        for layer_buffer in self._layer_buffers.values():
+            total += layer_buffer.total_bytes
         return total
 
     def __len__(self) -> int:
@@ -219,12 +245,24 @@ def _maybe_pin_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, bool, str | N
     return pinned, is_pinned, None if is_pinned else "pin_memory_returned_unpinned"
 
 
-def _to_host_tensor(tensor: torch.Tensor, *, clone: bool) -> torch.Tensor:
+def _to_host_layer_tensor(
+    tensor: torch.Tensor,
+    *,
+    clone: bool,
+    pin_memory: bool,
+) -> tuple[torch.Tensor, bool, str | None]:
     host = tensor.detach()
     if host.device.type != "cpu":
         host = host.cpu()
         clone = True
-    return host.clone() if clone else host
+    if clone:
+        host = host.clone()
+    if not host.is_contiguous():
+        host = host.contiguous()
+    if not pin_memory:
+        return host, False, None
+    pinned, pinned_ok, pin_error = _maybe_pin_tensor(host)
+    return pinned, pinned_ok, pin_error
 
 
 def _expert_stride(tensor: torch.Tensor) -> tuple[int, ...]:

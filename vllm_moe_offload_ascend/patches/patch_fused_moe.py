@@ -532,6 +532,9 @@ def _patch_ascend_envs() -> None:
             if "VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY" not in os.environ
             else _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY", "0")
         ),
+        "VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE": lambda: _to_bool_env(
+            "VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE", "1"
+        ),
         "VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH": lambda: int(
             os.getenv("VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH", "1")
         ),
@@ -925,13 +928,32 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             perf_counter() - wave_microbatch_plan_start
         ) * 1000.0
         wave_microbatches = None
+        wave_h2d_bytes_by_index = {}
+        wave_compute_cost_by_index = {}
         if async_stage:
             schedule_start = perf_counter()
+            for wave_index, wave in enumerate(waves):
+                wave_h2d_bytes_by_index[int(wave_index)] = int(
+                    sum(
+                        runtime.estimate_expert_weight_bytes(
+                            layer_id=offload.layer_id,
+                            expert_id=int(expert_id),
+                        )
+                        for expert_id in wave
+                        if not bool(readiness.get(int(expert_id), False))
+                    )
+                )
+                wave_compute_cost_by_index[int(wave_index)] = float(
+                    wave_plan.wave_tokens(wave)
+                )
             async_schedule = plan_b2_prefill_async_schedule(
                 waves,
                 slot_readiness=readiness,
                 prefetch_depth=runtime.config.effective_prefill_prefetch_depth,
                 buffer_count=runtime.config.effective_prefill_buffer_count,
+                h2d_bytes_by_wave=wave_h2d_bytes_by_index,
+                compute_cost_by_wave=wave_compute_cost_by_index,
+                transfer_aware=runtime.config.transfer_aware_wave_schedule,
             )
             schedule_ms = (perf_counter() - schedule_start) * 1000.0
             stage_records = {}

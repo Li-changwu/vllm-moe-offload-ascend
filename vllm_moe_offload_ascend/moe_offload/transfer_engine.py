@@ -40,9 +40,25 @@ class TransferEngine:
 
     def load_sync(self, bundle: ExpertWeightBundle, slot: ExpertSlot) -> None:
         LayoutValidator.validate_copy_compatible(bundle, slot.as_bundle())
-        slot.w13.copy_(bundle.w13)
-        slot.w2.copy_(bundle.w2)
+        _copy_loads(((bundle, slot),), non_blocking=False)
         slot.state = SlotState.READY
+
+    def load_many_sync(
+        self,
+        loads: list[tuple[ExpertWeightBundle, ExpertSlot]],
+        *,
+        validate_layout: bool = True,
+    ) -> None:
+        if not loads:
+            return
+        if validate_layout:
+            for bundle, slot in loads:
+                LayoutValidator.validate_copy_compatible(bundle, slot.as_bundle())
+        for _, slot in loads:
+            slot.state = SlotState.LOADING
+        _copy_loads(tuple(loads), non_blocking=False)
+        for _, slot in loads:
+            slot.state = SlotState.READY
 
     def load_async(
         self,
@@ -61,8 +77,7 @@ class TransferEngine:
             stream.wait_event(getattr(wait_event, "event", wait_event))
         slot.state = SlotState.LOADING
         with torch.npu.stream(stream):
-            slot.w13.copy_(bundle.w13, non_blocking=True)
-            slot.w2.copy_(bundle.w2, non_blocking=True)
+            _copy_loads(((bundle, slot),), non_blocking=True)
             ready_event = None
             if record_event:
                 ready_event = torch.npu.Event()
@@ -96,8 +111,7 @@ class TransferEngine:
         with torch.npu.stream(stream):
             for bundle, slot in loads:
                 slot.state = SlotState.LOADING
-                slot.w13.copy_(bundle.w13, non_blocking=True)
-                slot.w2.copy_(bundle.w2, non_blocking=True)
+            _copy_loads(tuple(loads), non_blocking=True)
             ready_event = None
             if record_event:
                 ready_event = torch.npu.Event()
@@ -121,3 +135,94 @@ class TransferEngine:
 
             self._h2d_stream = torch.npu.Stream()
         return self._h2d_stream
+
+
+def _copy_loads(
+    loads: tuple[tuple[ExpertWeightBundle, ExpertSlot], ...],
+    *,
+    non_blocking: bool,
+) -> None:
+    for run in _contiguous_load_runs(loads):
+        if len(run) <= 1:
+            bundle, slot = run[0]
+            slot.w13.copy_(bundle.w13, non_blocking=non_blocking)
+            slot.w2.copy_(bundle.w2, non_blocking=non_blocking)
+            continue
+
+        src_w13 = _try_batch_view(tuple(bundle.w13 for bundle, _ in run))
+        src_w2 = _try_batch_view(tuple(bundle.w2 for bundle, _ in run))
+        dst_w13 = _try_batch_view(tuple(slot.w13 for _, slot in run))
+        dst_w2 = _try_batch_view(tuple(slot.w2 for _, slot in run))
+        if src_w13 is None or src_w2 is None or dst_w13 is None or dst_w2 is None:
+            for bundle, slot in run:
+                slot.w13.copy_(bundle.w13, non_blocking=non_blocking)
+                slot.w2.copy_(bundle.w2, non_blocking=non_blocking)
+            continue
+
+        dst_w13.copy_(src_w13, non_blocking=non_blocking)
+        dst_w2.copy_(src_w2, non_blocking=non_blocking)
+
+
+def _contiguous_load_runs(
+    loads: tuple[tuple[ExpertWeightBundle, ExpertSlot], ...],
+) -> tuple[tuple[tuple[ExpertWeightBundle, ExpertSlot], ...], ...]:
+    runs: list[list[tuple[ExpertWeightBundle, ExpertSlot]]] = []
+    current: list[tuple[ExpertWeightBundle, ExpertSlot]] = []
+    previous_bundle: ExpertWeightBundle | None = None
+    previous_slot: ExpertSlot | None = None
+    for bundle, slot in loads:
+        can_extend = (
+            previous_bundle is not None
+            and previous_slot is not None
+            and int(bundle.layer_id) == int(previous_bundle.layer_id)
+            and int(bundle.expert_id) == int(previous_bundle.expert_id) + 1
+            and int(slot.slot_id) == int(previous_slot.slot_id) + 1
+        )
+        if not can_extend and current:
+            runs.append(current)
+            current = []
+        current.append((bundle, slot))
+        previous_bundle = bundle
+        previous_slot = slot
+    if current:
+        runs.append(current)
+    return tuple(tuple(run) for run in runs)
+
+
+def _try_batch_view(tensors: tuple[object, ...]):
+    if not tensors:
+        return None
+    first = tensors[0]
+    if len(tensors) == 1:
+        return first.unsqueeze(0)
+    element_size = int(first.element_size())
+    first_ptr = int(first.data_ptr())
+    previous_ptr = first_ptr
+    delta_elems: int | None = None
+    for index, tensor in enumerate(tensors):
+        if tensor.device != first.device or tensor.dtype != first.dtype:
+            return None
+        if tuple(tensor.shape) != tuple(first.shape):
+            return None
+        if tuple(tensor.stride()) != tuple(first.stride()):
+            return None
+        ptr = int(tensor.data_ptr())
+        if index == 0:
+            continue
+        delta_bytes = ptr - previous_ptr
+        if delta_bytes <= 0 or delta_bytes % element_size != 0:
+            return None
+        current_delta_elems = delta_bytes // element_size
+        if int(current_delta_elems) != int(first.numel()):
+            return None
+        if delta_elems is None:
+            delta_elems = int(current_delta_elems)
+        elif int(current_delta_elems) != int(delta_elems):
+            return None
+        previous_ptr = ptr
+    if delta_elems is None:
+        return first.unsqueeze(0)
+    return first.as_strided(
+        (len(tensors), *tuple(first.shape)),
+        (int(delta_elems), *tuple(first.stride())),
+    )
